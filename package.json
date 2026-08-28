@@ -1,0 +1,22 @@
+{
+  "name": "tero-network",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server.ts",
+    "build": "esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs && cp -r index.html favicon.svg apple-touch-icon.png og-preview-v3.jpg manifest.json tero-hq-manifest.json sw.js tero-hq-sw.js icon-192.png icon-512.png tero-logo-new.png tero-logo-new.svg logo.png default-avatar.png assets badges dist/ 2>/dev/null || true",
+    "start": "node server.ts"
+  },
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "express": "^4.21.2",
+    "firebase": "^12.18.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.13.4",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.19.3"
+  }
+}

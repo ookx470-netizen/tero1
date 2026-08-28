@@ -1,0 +1,8 @@
+{
+  "name": "TERO",
+  "description": "Together we build a better digital future. TERO Network platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

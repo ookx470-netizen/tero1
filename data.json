@@ -1,0 +1,42 @@
+{
+  "users": [
+    {
+      "telegram": "@founder_test_tg",
+      "id": "u_1787569385435",
+      "membershipPlan": "VIP 1",
+      "isFrozen": false,
+      "referralsCount": 0,
+      "email": "founder_test@tero.com",
+      "joinedAt": "2026-08-24T11:03:05.435Z",
+      "usdtBalance": 0,
+      "balance": 0,
+      "status": "active",
+      "username": "founder_test"
+    },
+    {
+      "balance": 0,
+      "usdtBalance": 0,
+      "username": "+96404502302723",
+      "email": "+96404502302723@tero.com",
+      "referralsCount": 0,
+      "membershipPlan": "VIP 1",
+      "status": "active",
+      "isFrozen": false,
+      "id": "u_1787584486622",
+      "joinedAt": "2026-08-24T15:14:46.622Z"
+    }
+  ],
+  "deposits": [],
+  "withdrawals": [],
+  "tasks": [],
+  "siteSettings": {
+    "siteName": "TERO Network",
+    "maintenanceMode": false,
+    "telegramSupportUsername": "TeroComunityBot",
+    "emergencyWithdrawalMode": false,
+    "min_deposit_amount": 5,
+    "min_withdrawal_amount": 3,
+    "withdrawal_fee": 21,
+    "max_withdrawal_amount": 5000
+  }
+}

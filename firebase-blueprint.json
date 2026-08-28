@@ -1,0 +1,76 @@
+{
+  "$schema": "https://raw.githubusercontent.com/firebase/firebase-tools/master/schema/firestore-blueprint.json",
+  "entities": {
+    "User": {
+      "collection": "users",
+      "description": "User accounts and balances",
+      "fields": {
+        "id": { "type": "string" },
+        "username": { "type": "string" },
+        "email": { "type": "string" },
+        "telegram": { "type": "string" },
+        "balance": { "type": "number" },
+        "usdtBalance": { "type": "number" },
+        "status": { "type": "string" },
+        "isFrozen": { "type": "boolean" },
+        "joinedAt": { "type": "string" },
+        "membershipPlan": { "type": "string" },
+        "referralsCount": { "type": "number" },
+        "avatarUrl": { "type": "string" }
+      }
+    },
+    "Deposit": {
+      "collection": "deposits",
+      "description": "Deposit transactions",
+      "fields": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "username": { "type": "string" },
+        "amount": { "type": "string" },
+        "network": { "type": "string" },
+        "status": { "type": "string" },
+        "txHash": { "type": "string" },
+        "createdAt": { "type": "string" }
+      }
+    },
+    "Withdrawal": {
+      "collection": "withdrawals",
+      "description": "Withdrawal requests",
+      "fields": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "username": { "type": "string" },
+        "amount": { "type": "number" },
+        "usdtAmount": { "type": "number" },
+        "address": { "type": "string" },
+        "network": { "type": "string" },
+        "status": { "type": "string" },
+        "createdAt": { "type": "string" }
+      }
+    },
+    "Task": {
+      "collection": "tasks",
+      "description": "Earn tasks",
+      "fields": {
+        "id": { "type": "string" },
+        "platform": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "reward": { "type": "number" },
+        "targetUrl": { "type": "string" },
+        "isActive": { "type": "boolean" },
+        "order": { "type": "number" }
+      }
+    },
+    "SiteSettings": {
+      "collection": "siteSettings",
+      "description": "Platform settings",
+      "fields": {
+        "siteName": { "type": "string" },
+        "maintenanceMode": { "type": "boolean" },
+        "telegramSupportUsername": { "type": "string" },
+        "emergencyWithdrawalMode": { "type": "boolean" }
+      }
+    }
+  }
+}
