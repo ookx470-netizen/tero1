@@ -1288,7 +1288,7 @@ app.get("/api/auth/me", (req, res) => {
 
 app.get("/api/user/profile", (req, res) => {
   const db = loadDB();
-  const user = db.users[0] || { id: "u1", username: "asse_24", balance: 0.00 };
+  const user = (db.users[0] || { id: "u1", username: "asse_24", balance: 0.00, referralCode: "TQ69JZ" }) as User;
   res.json({
     ...user,
     referralCode: user.referralCode || "TQ69JZ",
@@ -1494,7 +1494,7 @@ app.get("/api/referrals", (req, res) => {
 
 app.get("/api/referrals/stats", (req, res) => {
   const db = loadDB();
-  const user = db.users[0];
+  const user = db.users[0] as User | undefined;
   res.json({ totalEarned: 0.00, totalReferrals: 0, referralCode: user?.referralCode || "TQ69JZ" });
 });
 
