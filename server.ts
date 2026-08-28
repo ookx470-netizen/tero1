@@ -1510,6 +1510,12 @@ app.get("/api/notifications", (req, res) => {
   res.json([]);
 });
 
+// API Error-handling middleware
+app.use("/api/*", (err: any, req: any, res: any, next: any) => {
+  console.error("API Error:", err);
+  res.status(500).json({ ok: false, error: err.message || "Internal server error" });
+});
+
 // Generic Fallback Catch-All
 app.all("/api/*", (req, res) => {
   if (req.method === "GET") {
@@ -1518,7 +1524,7 @@ app.all("/api/*", (req, res) => {
     }
     return res.json({});
   }
-  res.json({ success: true });
+  res.json({ success: true, ok: true });
 });
 
 // SPA fallback for client-side routing (e.g. /tero-hq)
