@@ -4,7 +4,7 @@ import fs from "fs";
 import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import rateLimit from "express-rate-limit";
+import { rateLimit } from "express-rate-limit";
 import admin from "firebase-admin";
 
 const app = express();
