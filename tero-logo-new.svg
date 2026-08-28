@@ -1,0 +1,45 @@
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 320" width="1000" height="320" fill="none">
+  <defs>
+    <!-- Cyan gradient for T left wing -->
+    <linearGradient id="tWing" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7EF5FF" />
+      <stop offset="100%" stop-color="#38DEF0" />
+    </linearGradient>
+
+    <!-- Vibrant Cyan ring for O -->
+    <linearGradient id="oRing" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6DF0FF" />
+      <stop offset="60%" stop-color="#22D5EB" />
+      <stop offset="100%" stop-color="#0BBAD0" />
+    </linearGradient>
+
+    <filter id="subtleGlow" x="-15%" y="-15%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="0" stdDeviation="4" flood-color="#22D5EB" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+
+  <g id="tero-wordmark" transform="translate(80, 20)">
+    <!-- Letter T -->
+    <!-- Left turquoise wing -->
+    <path d="M 0 74 C 0 70.5 2.8 68 6.5 68 L 76 68 L 76 96 L 14 96 C 5.5 96 0 91.5 0 85 Z" fill="url(#tWing)" />
+
+    <!-- Right bar & Vertical Stem of T -->
+    <path d="M 76 68 L 164 68 C 168 68 171 71 171 75 L 171 89 C 171 93 168 96 164 96 L 138 96 L 138 214 C 138 219.5 133.5 224 128 224 L 98 224 C 92.5 224 88 219.5 88 214 L 88 96 L 76 96 Z" fill="#FFFFFF" />
+
+    <!-- Letter e -->
+    <g transform="translate(198, 0)">
+      <path d="M 0 152 C 0 108 32 76 78 76 C 126 76 156 108 156 154 C 156 159 152 163 147 163 L 34 163 C 37 186 54 200 80 200 C 99 200 113 192 121 180 C 124 176 129 175 133 178 L 146 187 C 150 190 150 195 146 200 C 132 218 109 230 79 230 C 31 230 0 198 0 152 Z M 78 103 C 55 103 40 118 36 138 L 120 138 C 117 118 101 103 78 103 Z" fill="#FFFFFF" />
+    </g>
+
+    <!-- Letter r -->
+    <g transform="translate(390, 0)">
+      <path d="M 0 88 C 0 82.5 4.5 78 10 78 L 38 78 C 43.5 78 48 82.5 48 88 L 48 110 C 60 88 80 76 106 76 C 112 76 118 78 122 81 C 126 84 127 90 124 95 L 106 120 C 103 124 98 125 93 123 C 83 119 70 122 60 132 C 50 142 48 156 48 170 L 48 214 C 48 219.5 43.5 224 38 224 L 10 224 C 4.5 224 0 219.5 0 214 Z" fill="#FFFFFF" />
+    </g>
+
+    <!-- Letter o (Luminous Torus) -->
+    <g transform="translate(540, 0)">
+      <path d="M 0 152 C 0 107 34 74 82 74 C 130 74 164 107 164 152 C 164 197 130 230 82 230 C 34 230 0 197 0 152 Z M 82 107 C 54 107 36 127 36 152 C 36 177 54 197 82 197 C 110 197 128 177 128 152 C 128 127 110 107 82 107 Z" fill="url(#oRing)" filter="url(#subtleGlow)" />
+    </g>
+  </g>
+</svg>

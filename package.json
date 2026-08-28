@@ -11,11 +11,16 @@
   "dependencies": {
     "@resvg/resvg-js": "^2.6.2",
     "express": "^4.21.2",
-    "firebase": "^12.18.0"
+    "firebase-admin": "^13.0.2",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "express-rate-limit": "^7.4.1"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",
     "@types/node": "^22.13.4",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/jsonwebtoken": "^9.0.7",
     "esbuild": "^0.25.0",
     "tsx": "^4.19.3"
   }

@@ -1,8 +1,21 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    // SECURITY FIX: this used to be `allow read, write: if true;` — wide
+    // open to the entire internet. Because the Firebase project config
+    // (apiKey, projectId, etc.) is inherently public in any client-side app,
+    // that rule meant anyone could read or overwrite every user's balance,
+    // every withdrawal, and every site setting directly from the browser
+    // console, completely bypassing the Express server and its API checks.
+    //
+    // The Express server has been switched to the Firebase Admin SDK
+    // (server.ts), which authenticates with a service-account credential and
+    // therefore BYPASSES these rules entirely — it keeps working normally.
+    // Everyone else (the browser, or anyone with the public config) is now
+    // denied direct access to Firestore. All reads/writes must go through
+    // the server's authenticated /api/* routes instead.
     match /{document=**} {
-      allow read, write: if true;
+      allow read, write: if false;
     }
   }
 }
