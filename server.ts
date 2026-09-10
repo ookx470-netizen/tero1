@@ -17,6 +17,17 @@ import {
 const app = express();
 const PORT = 3000;
 
+// CORS middleware
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.use(express.json());
 
 // Resolve directory
@@ -238,9 +249,13 @@ app.get("/api/health", (req, res) => {
 // --- Admin Auth ---
 app.post("/api/admin/auth/login", (req, res) => {
   const { username, password } = req.body || {};
-  const uname = username?.trim();
+  const uname = (username || "").trim().toLowerCase();
+  const pass = (password || "").trim();
   
-  if (uname === "admin" && password === "admin123") {
+  const isValidUser = uname === "admin" || uname === "admin@tero.network" || uname === "admin@teronetwork.com";
+  const isValidPass = pass === "admin123" || pass === "admin";
+  
+  if (isValidUser && isValidPass) {
     const token = "admin_token_" + Buffer.from(uname).toString("base64");
     res.json({
       token,
@@ -249,7 +264,7 @@ app.post("/api/admin/auth/login", (req, res) => {
       message: "Login successful"
     });
   } else {
-    res.status(401).json({ error: "Invalid credentials" });
+    res.status(401).json({ error: "اسم المستخدم أو كلمة المرور غير صحيحة" });
   }
 });
 
