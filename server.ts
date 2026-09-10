@@ -187,57 +187,82 @@ async function hydrateFromFirestore() {
   }
 }
 
+let isHydrated = false;
+let hydrationPromise: Promise<void> | null = null;
+
+async function ensureHydrated() {
+  if (isHydrated) return;
+  if (!hydrationPromise) {
+    hydrationPromise = (async () => {
+      await hydrateFromFirestore();
+      isHydrated = true;
+    })();
+  }
+  await hydrationPromise;
+}
+
 // Trigger initial cloud sync
-hydrateFromFirestore();
+ensureHydrated().catch(() => {});
 
 function loadDB(): DBData {
   return inMemoryDB;
 }
 
-function saveDB(db: DBData) {
+async function saveUserDirect(user: User) {
+  if (firestoreDb && user && user.id) {
+    try {
+      await setDoc(doc(firestoreDb, "users", user.id), user);
+    } catch (err) {
+      console.error("Failed to save user directly to Firestore:", err);
+    }
+  }
+}
+
+async function saveDBAsync(db: DBData) {
   inMemoryDB = db;
-  // 1. Local backup
   try {
     fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
   } catch (err) {
     console.error("Failed to save local DB", err);
   }
 
-  // 2. Sync to Cloud Firestore asynchronously
   if (firestoreDb) {
-    (async () => {
-      try {
-        // Save users
-        for (const user of db.users) {
-          if (user.id) {
-            await setDoc(doc(firestoreDb!, "users", user.id), user);
-          }
+    try {
+      for (const user of db.users) {
+        if (user.id) {
+          await setDoc(doc(firestoreDb, "users", user.id), user);
         }
-        // Save deposits
-        for (const dep of db.deposits) {
-          if (dep.id) {
-            await setDoc(doc(firestoreDb!, "deposits", dep.id), dep);
-          }
-        }
-        // Save withdrawals
-        for (const wd of db.withdrawals) {
-          if (wd.id) {
-            await setDoc(doc(firestoreDb!, "withdrawals", wd.id), wd);
-          }
-        }
-        // Save tasks
-        for (const task of db.tasks) {
-          if (task.id) {
-            await setDoc(doc(firestoreDb!, "tasks", task.id), task);
-          }
-        }
-        // Save site settings
-        await setDoc(doc(firestoreDb!, "siteSettings", "global"), db.siteSettings);
-      } catch (cloudErr) {
-        console.error("Error writing to Firestore:", cloudErr);
       }
-    })();
+      for (const dep of db.deposits) {
+        if (dep.id) {
+          await setDoc(doc(firestoreDb, "deposits", dep.id), dep);
+        }
+      }
+      for (const wd of db.withdrawals) {
+        if (wd.id) {
+          await setDoc(doc(firestoreDb, "withdrawals", wd.id), wd);
+        }
+      }
+      for (const task of db.tasks) {
+        if (task.id) {
+          await setDoc(doc(firestoreDb, "tasks", task.id), task);
+        }
+      }
+      await setDoc(doc(firestoreDb, "siteSettings", "global"), db.siteSettings);
+    } catch (cloudErr) {
+      console.error("Error writing to Firestore:", cloudErr);
+    }
   }
+}
+
+function saveDB(db: DBData) {
+  inMemoryDB = db;
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
+  } catch (err) {
+    console.error("Failed to save local DB", err);
+  }
+  saveDBAsync(db).catch(() => {});
 }
 
 
@@ -290,7 +315,8 @@ app.post("/api/admin/auth/logout", (req, res) => {
 });
 
 // --- Admin Users Management ---
-app.get("/api/admin/users", (req, res) => {
+app.get("/api/admin/users", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
   const search = (req.query.search as string || "").toLowerCase();
   const page = parseInt(req.query.page as string || "1", 10);
@@ -1179,6 +1205,7 @@ const TELEGRAM_BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME || "TeroComunity
 // Telegram Bot Service for Auto-linking Accounts (@TeroComunityBot)
 async function processTelegramMessage(msg: any) {
   if (!msg || !msg.text) return;
+  await ensureHydrated();
   const text = msg.text.trim();
   const chatId = msg.chat.id;
   const sender = msg.from;
@@ -1206,7 +1233,8 @@ async function processTelegramMessage(msg: any) {
       
       if (matchedUser) {
         matchedUser.telegram = tgUsername;
-        saveDB(db);
+        await saveUserDirect(matchedUser);
+        await saveDBAsync(db);
         
         // Reply to user on Telegram
         await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -1280,38 +1308,87 @@ app.get("/api/site-settings/public/telegram_support_username", (req, res) => {
 });
 
 // --- User-Facing API Routes ---
-app.post("/api/auth/login", (req, res) => {
+app.post("/api/auth/register", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
-  const { username, identifier, email } = req.body || {};
-  const uname = username || identifier || email || "asse_24";
-  let user = db.users.find(u => u.username === uname || u.email === uname);
+  const { phone, countryCode, countryIso, country, referralCode, password, language, email, username } = req.body || {};
+
+  const cleanPhone = (phone || "").toString().trim();
+  const cleanEmail = (email || "").toString().trim().toLowerCase();
+  const cleanUsername = (username || cleanPhone || (cleanEmail ? cleanEmail.split("@")[0] : "") || ("user_" + Math.floor(100000 + Math.random() * 900000))).toString().trim();
+
+  let user = db.users.find(u => 
+    (cleanPhone && u.username === cleanPhone) ||
+    (cleanEmail && u.email === cleanEmail) ||
+    (cleanUsername && u.username === cleanUsername)
+  );
+
   if (!user) {
     user = {
-      id: "u_" + Date.now(),
-      username: uname,
-      email: `${uname}@tero.com`,
+      id: "u_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
+      username: cleanUsername,
+      email: cleanEmail || (cleanPhone ? `${cleanPhone}@tero.com` : `${cleanUsername}@tero.com`),
+      telegram: "",
       balance: 0.00,
       usdtBalance: 0.00,
       status: "active",
       isFrozen: false,
       joinedAt: new Date().toISOString(),
       membershipPlan: "none",
-      referralsCount: 0
+      referralsCount: 0,
+      membershipTier: "free",
+      referralCode: referralCode || ("TQ" + Math.floor(10000 + Math.random() * 90000))
     };
-    db.users.push(user);
-    saveDB(db);
+    db.users.unshift(user);
+    await saveUserDirect(user);
+    await saveDBAsync(db);
   }
 
+  const token = "user_token_" + Buffer.from(user.username).toString("base64");
   res.json({
-    token: "user_token_" + Buffer.from(uname).toString("base64"),
+    token,
     user
   });
 });
 
-app.get("/api/auth/me", (req, res) => {
+app.post("/api/auth/login", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const { username, identifier, email, phone } = req.body || {};
+  const uname = (username || identifier || email || phone || "asse_24").toString().trim();
+  let user = db.users.find(u => u.username.toLowerCase() === uname.toLowerCase() || u.email.toLowerCase() === uname.toLowerCase());
+  if (!user) {
+    user = {
+      id: "u_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
+      username: uname,
+      email: uname.includes("@") ? uname : `${uname}@tero.com`,
+      telegram: "",
+      balance: 0.00,
+      usdtBalance: 0.00,
+      status: "active",
+      isFrozen: false,
+      joinedAt: new Date().toISOString(),
+      membershipPlan: "none",
+      referralsCount: 0,
+      membershipTier: "free",
+      referralCode: "TQ" + Math.floor(10000 + Math.random() * 90000)
+    };
+    db.users.unshift(user);
+    await saveUserDirect(user);
+    await saveDBAsync(db);
+  }
+
+  res.json({
+    token: "user_token_" + Buffer.from(user.username).toString("base64"),
+    user
+  });
+});
+
+app.get("/api/auth/me", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
   const authHeader = req.headers.authorization || "";
-  let user = db.users[0];
+  let user: User | undefined;
   if (authHeader.startsWith("Bearer user_token_")) {
     try {
       const b64 = authHeader.replace("Bearer user_token_", "");
@@ -1321,6 +1398,8 @@ app.get("/api/auth/me", (req, res) => {
     } catch {}
   }
   
+  if (!user) user = db.users[0];
+
   const isLinked = Boolean(user && user.telegram && user.telegram.trim() !== "");
   res.json({
     ...(user || { id: "u1", username: "asse_24", email: "asse_24@tero.com" }),
@@ -1328,9 +1407,20 @@ app.get("/api/auth/me", (req, res) => {
   });
 });
 
-app.get("/api/user/profile", (req, res) => {
+app.get("/api/user/profile", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
-  const user = (db.users[0] || { id: "u1", username: "asse_24", balance: 0.00, referralCode: "TQ69JZ" }) as User;
+  const authHeader = req.headers.authorization || "";
+  let user: User | undefined;
+  if (authHeader.startsWith("Bearer user_token_")) {
+    try {
+      const b64 = authHeader.replace("Bearer user_token_", "");
+      const uname = Buffer.from(b64, "base64").toString("utf8");
+      const found = db.users.find(u => u.username === uname || u.email === uname);
+      if (found) user = found;
+    } catch {}
+  }
+  if (!user) user = (db.users[0] || { id: "u1", username: "asse_24", balance: 0.00, referralCode: "TQ69JZ" }) as User;
   res.json({
     ...user,
     referralCode: user.referralCode || "TQ69JZ",
@@ -1341,10 +1431,11 @@ app.get("/api/user/profile", (req, res) => {
   });
 });
 
-app.get("/api/user/telegram/status", (req, res) => {
+app.get("/api/user/telegram/status", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
   const authHeader = req.headers.authorization || "";
-  let user = db.users[0];
+  let user: User | undefined;
   if (authHeader.startsWith("Bearer user_token_")) {
     try {
       const b64 = authHeader.replace("Bearer user_token_", "");
@@ -1353,14 +1444,16 @@ app.get("/api/user/telegram/status", (req, res) => {
       if (found) user = found;
     } catch {}
   }
+  if (!user) user = db.users[0];
   const isLinked = Boolean(user && user.telegram && user.telegram.trim() !== "");
   res.json({ linked: isLinked, telegramUsername: user?.telegram || null });
 });
 
-app.post("/api/user/telegram/link-token", (req, res) => {
+app.post("/api/user/telegram/link-token", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
   const authHeader = req.headers.authorization || "";
-  let user = db.users[0];
+  let user: User | undefined;
   if (authHeader.startsWith("Bearer user_token_")) {
     try {
       const b64 = authHeader.replace("Bearer user_token_", "");
@@ -1369,6 +1462,7 @@ app.post("/api/user/telegram/link-token", (req, res) => {
       if (found) user = found;
     } catch {}
   }
+  if (!user) user = db.users[0];
   
   const rawBotName = TELEGRAM_BOT_USERNAME || db.siteSettings.telegramSupportUsername || "TeroComunityBot";
   const cleanBotName = rawBotName.replace(/^@/, "");
@@ -1382,7 +1476,8 @@ app.post("/api/user/telegram/link-token", (req, res) => {
 });
 
 // Manual or direct verification endpoint from external bots or webhooks
-app.post("/api/user/telegram/verify-link", (req, res) => {
+app.post("/api/user/telegram/verify-link", async (req, res) => {
+  await ensureHydrated();
   const { token, telegramUsername, userId } = req.body || {};
   const db = loadDB();
   
@@ -1396,7 +1491,8 @@ app.post("/api/user/telegram/verify-link", (req, res) => {
   
   if (user) {
     user.telegram = telegramUsername || "@user_tg";
-    saveDB(db);
+    await saveUserDirect(user);
+    await saveDBAsync(db);
     return res.json({ ok: true, success: true, user });
   }
   
