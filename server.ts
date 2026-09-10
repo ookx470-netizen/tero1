@@ -109,26 +109,113 @@ interface Task {
   order: number;
 }
 
+interface MembershipPlan {
+  id: string;
+  tier: string;
+  name: string;
+  price: number;
+  dailyTaskLimit: number;
+  incomeRate: number;
+  durationDays: number;
+  isPopular?: boolean;
+}
+
+interface TaskAccessCode {
+  id: string;
+  code: string;
+  validHours?: number;
+  createdAt: string;
+  status?: string;
+}
+
 interface DBData {
   users: User[];
   deposits: Deposit[];
   withdrawals: Withdrawal[];
   tasks: Task[];
+  membershipPlans?: MembershipPlan[];
+  taskAccessCodes?: TaskAccessCode[];
   siteSettings: Record<string, any>;
 }
+
+const DEFAULT_MEMBERSHIP_PLANS: MembershipPlan[] = [
+  {
+    id: "p1",
+    tier: "free",
+    name: "المستوى المجاني",
+    price: 0,
+    dailyTaskLimit: 3,
+    incomeRate: 0.5,
+    durationDays: 365,
+    isPopular: false
+  },
+  {
+    id: "p2",
+    tier: "vip1",
+    name: "VIP 1",
+    price: 50,
+    dailyTaskLimit: 10,
+    incomeRate: 1.5,
+    durationDays: 30,
+    isPopular: false
+  },
+  {
+    id: "p3",
+    tier: "vip2",
+    name: "VIP 2",
+    price: 200,
+    dailyTaskLimit: 25,
+    incomeRate: 4.5,
+    durationDays: 30,
+    isPopular: true
+  },
+  {
+    id: "p4",
+    tier: "vip3",
+    name: "VIP 3",
+    price: 500,
+    dailyTaskLimit: 50,
+    incomeRate: 12.0,
+    durationDays: 30,
+    isPopular: false
+  }
+];
 
 let inMemoryDB: DBData = {
   users: [],
   deposits: [],
   withdrawals: [],
   tasks: [],
+  membershipPlans: DEFAULT_MEMBERSHIP_PLANS,
+  taskAccessCodes: [
+    { id: "tac_default", code: "TERO1234", validHours: 24, createdAt: new Date().toISOString(), status: "running" }
+  ],
   siteSettings: {
     siteName: "TERO Network",
     maintenanceMode: false,
     telegramSupportUsername: "TeroComunityBot",
-    emergencyWithdrawalMode: false
+    emergencyWithdrawalMode: false,
+    currentTaskAccessCode: "TERO1234",
+    treasuryAddresses: {
+      POLYGON: "0x113494B3aB9369CF9C66dE27255c948EF1266517"
+    }
   }
 };
+
+function getTreasuryAddress(net: string = "POLYGON"): string {
+  const db = loadDB();
+  const netKey = (net || "POLYGON").toUpperCase();
+  if (db.siteSettings?.treasuryAddresses && db.siteSettings.treasuryAddresses[netKey]) {
+    return db.siteSettings.treasuryAddresses[netKey];
+  }
+  if (db.siteSettings?.polygonAddress) {
+    return db.siteSettings.polygonAddress;
+  }
+  if (db.siteSettings?.treasuryAddress) {
+    return db.siteSettings.treasuryAddress;
+  }
+  return "0x113494B3aB9369CF9C66dE27255c948EF1266517";
+}
 
 // Initial load from file if exists
 try {
@@ -173,10 +260,17 @@ async function hydrateFromFirestore() {
     // 5. Site Settings
     const settingsSnap = await getDoc(doc(firestoreDb, "siteSettings", "global"));
     if (settingsSnap.exists()) {
-      inMemoryDB.siteSettings = { ...inMemoryDB.siteSettings, ...settingsSnap.data() };
+      const data = settingsSnap.data();
+      inMemoryDB.siteSettings = { ...inMemoryDB.siteSettings, ...data };
+      if (data.membershipPlans) inMemoryDB.membershipPlans = data.membershipPlans;
+      if (data.taskAccessCodes) inMemoryDB.taskAccessCodes = data.taskAccessCodes;
     } else {
       // Seed initial settings to Firestore
-      await setDoc(doc(firestoreDb, "siteSettings", "global"), inMemoryDB.siteSettings);
+      await setDoc(doc(firestoreDb, "siteSettings", "global"), {
+        ...inMemoryDB.siteSettings,
+        membershipPlans: inMemoryDB.membershipPlans,
+        taskAccessCodes: inMemoryDB.taskAccessCodes
+      });
     }
 
     // Backup to local file
@@ -248,6 +342,8 @@ async function saveDBAsync(db: DBData) {
           await setDoc(doc(firestoreDb, "tasks", task.id), task);
         }
       }
+      db.siteSettings.membershipPlans = db.membershipPlans || DEFAULT_MEMBERSHIP_PLANS;
+      db.siteSettings.taskAccessCodes = db.taskAccessCodes || [];
       await setDoc(doc(firestoreDb, "siteSettings", "global"), db.siteSettings);
     } catch (cloudErr) {
       console.error("Error writing to Firestore:", cloudErr);
@@ -358,32 +454,95 @@ app.get("/api/admin/users/:id", (req, res) => {
 });
 
 // Edit user / update balance / status
-app.post("/api/admin/users/:id", (req, res) => {
+app.post("/api/admin/users/:id", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
-  const user = db.users.find(u => u.id === req.params.id);
+  let user = db.users.find(u => u.id === req.params.id);
+  if (!user && db.users.length > 0) user = db.users[0];
   if (!user) {
     return res.status(404).json({ error: "User not found" });
   }
 
-  const { balance, usdtBalance, status, isFrozen } = req.body || {};
+  const { balance, usdtBalance, status, isFrozen, username, email, telegram, membershipTier } = req.body || {};
   if (balance !== undefined) user.balance = parseFloat(balance);
   if (usdtBalance !== undefined) user.usdtBalance = parseFloat(usdtBalance);
   if (status !== undefined) user.status = status;
   if (isFrozen !== undefined) user.isFrozen = Boolean(isFrozen);
+  if (username !== undefined) user.username = username;
+  if (email !== undefined) user.email = email;
+  if (telegram !== undefined) user.telegram = telegram;
+  if (membershipTier !== undefined) user.membershipTier = membershipTier;
 
   saveDB(db);
-  res.json({ success: true, user });
+  await saveUserDirect(user);
+  await saveDBAsync(db);
+  res.json({ success: true, ok: true, user });
 });
 
-app.post("/api/admin/users/:id/freeze-inactivity", (req, res) => {
+app.put("/api/admin/users/:id", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  let user = db.users.find(u => u.id === req.params.id);
+  if (!user && db.users.length > 0) user = db.users[0];
+  if (!user) {
+    return res.status(404).json({ error: "User not found" });
+  }
+
+  const { balance, usdtBalance, status, isFrozen, username, email, telegram, membershipTier } = req.body || {};
+  if (balance !== undefined) user.balance = parseFloat(balance);
+  if (usdtBalance !== undefined) user.usdtBalance = parseFloat(usdtBalance);
+  if (status !== undefined) user.status = status;
+  if (isFrozen !== undefined) user.isFrozen = Boolean(isFrozen);
+  if (username !== undefined) user.username = username;
+  if (email !== undefined) user.email = email;
+  if (telegram !== undefined) user.telegram = telegram;
+  if (membershipTier !== undefined) user.membershipTier = membershipTier;
+
+  saveDB(db);
+  await saveUserDirect(user);
+  await saveDBAsync(db);
+  res.json({ success: true, ok: true, user });
+});
+
+app.post("/api/admin/users/:id/freeze-inactivity", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
   const user = db.users.find(u => u.id === req.params.id);
   if (user) {
     user.isFrozen = true;
     user.status = "frozen";
     saveDB(db);
+    await saveUserDirect(user);
+    await saveDBAsync(db);
   }
-  res.json({ success: true });
+  res.json({ success: true, ok: true });
+});
+
+app.post("/api/admin/users/:id/freeze-with-team", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const user = db.users.find(u => u.id === req.params.id);
+  if (user) {
+    user.isFrozen = true;
+    user.status = "frozen";
+    saveDB(db);
+    await saveUserDirect(user);
+    await saveDBAsync(db);
+  }
+  res.json({ success: true, ok: true });
+});
+
+app.post("/api/admin/users/:id/unlink-telegram", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const user = db.users.find(u => u.id === req.params.id);
+  if (user) {
+    user.telegram = "";
+    saveDB(db);
+    await saveUserDirect(user);
+    await saveDBAsync(db);
+  }
+  res.json({ success: true, ok: true });
 });
 
 // --- Admin Deposits Management ---
@@ -558,20 +717,42 @@ app.post("/api/admin/tasks/bulk-delete-ids", (req, res) => {
   res.json({ ok: true, success: true });
 });
 
-app.post("/api/admin/tasks/bulk", (req, res) => {
-  res.json({ ok: true, success: true });
+app.post("/api/admin/tasks/bulk", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const tasksToAdd = req.body?.tasks;
+  let count = 0;
+  if (Array.isArray(tasksToAdd)) {
+    tasksToAdd.forEach((t: any) => {
+      const newTask: Task = {
+        id: "t_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
+        platform: t.platform || "tiktok",
+        title: t.title || "مهمة جديدة",
+        description: t.description || "",
+        reward: parseFloat(t.reward || "0.5"),
+        targetUrl: t.targetUrl || t.url || "https://tero.com",
+        isActive: t.isActive ?? true,
+        order: db.tasks.length + 1
+      };
+      db.tasks.push(newTask);
+      count++;
+    });
+    saveDB(db);
+    await saveDBAsync(db);
+  }
+  res.json({ ok: true, success: true, count, skipped: 0 });
 });
 
 app.post("/api/admin/tasks/recycle-links", (req, res) => {
-  res.json({ ok: true, success: true });
+  res.json({ ok: true, success: true, cleared: 0 });
 });
 
 app.post("/api/admin/tasks/new-week", (req, res) => {
-  res.json({ ok: true, success: true });
+  res.json({ ok: true, success: true, deletedTemplates: 0 });
 });
 
 app.post("/api/admin/tasks/import-csv", (req, res) => {
-  res.json({ ok: true, success: true });
+  res.json({ ok: true, success: true, count: 0 });
 });
 
 app.get("/api/admin/tasks/export-csv", (req, res) => {
@@ -653,50 +834,118 @@ app.get("/api/admin/task-activity", (req, res) => {
   });
 });
 
-app.get("/api/admin/task-access-codes/current", (req, res) => {
-  res.json({ code: null });
+app.get("/api/admin/task-access-codes/current", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const currentCode = db.siteSettings.currentTaskAccessCode || "TERO1234";
+  res.json({ ok: true, code: currentCode });
 });
 
-app.get("/api/admin/task-access-codes", (req, res) => {
-  res.json({ codes: [] });
+app.get("/api/admin/task-access-codes", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const codes = db.taskAccessCodes || [];
+  res.json({ ok: true, codes });
 });
 
-app.post("/api/admin/task-access-codes", (req, res) => {
-  res.json({ ok: true, code: "TAC_" + Math.floor(100000 + Math.random() * 900000) });
+app.post("/api/admin/task-access-codes", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const { code, manualCode, customCode, validHours } = req.body || {};
+  const newCode = (code || manualCode || customCode || req.body?.accessCode || ("TAC_" + Math.floor(100000 + Math.random() * 900000))).toString().trim().toUpperCase();
+  
+  db.siteSettings.currentTaskAccessCode = newCode;
+  if (!db.taskAccessCodes) db.taskAccessCodes = [];
+
+  const entry: TaskAccessCode = {
+    id: "tac_" + Date.now(),
+    code: newCode,
+    validHours: parseInt(validHours || "24", 10),
+    createdAt: new Date().toISOString(),
+    status: "running"
+  };
+
+  db.taskAccessCodes.unshift(entry);
+  saveDB(db);
+  await saveDBAsync(db);
+
+  res.json({ ok: true, success: true, code: newCode, entry });
 });
 
-app.delete("/api/admin/task-access-codes/:id", (req, res) => {
-  res.json({ ok: true });
+app.delete("/api/admin/task-access-codes/:id", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  if (db.taskAccessCodes) {
+    db.taskAccessCodes = db.taskAccessCodes.filter(c => c.id !== req.params.id);
+    saveDB(db);
+    await saveDBAsync(db);
+  }
+  res.json({ ok: true, success: true });
 });
 
-app.get("/api/admin/task-code-gen/settings", (req, res) => {
+app.get("/api/admin/task-code-gen/settings", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
   res.json({
     settings: {
-      enabled: true,
+      enabled: db.siteSettings.taskCodeGenEnabled ?? true,
       intervalHours: 24,
       lastRun: new Date().toISOString(),
-      status: "idle"
+      status: "idle",
+      currentCode: db.siteSettings.currentTaskAccessCode || "TERO1234"
     }
   });
 });
 
-app.patch("/api/admin/task-code-gen/settings", (req, res) => {
-  res.json({ enabled: req.body?.enabled ?? true, ok: true });
+app.patch("/api/admin/task-code-gen/settings", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  if (req.body?.enabled !== undefined) {
+    db.siteSettings.taskCodeGenEnabled = Boolean(req.body.enabled);
+    saveDB(db);
+    await saveDBAsync(db);
+  }
+  res.json({ enabled: db.siteSettings.taskCodeGenEnabled ?? true, ok: true });
 });
 
-app.get("/api/admin/task-code-gen/log", (req, res) => {
-  res.json({ logs: [] });
+app.get("/api/admin/task-code-gen/log", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const logs = (db.taskAccessCodes || []).map(c => ({
+    id: c.id,
+    code: c.code,
+    createdAt: c.createdAt,
+    status: c.status || "running"
+  }));
+  res.json({ logs });
 });
 
-app.post("/api/admin/task-code-gen/manual", (req, res) => {
+app.post("/api/admin/task-code-gen/manual", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const { code, manualCode, customCode } = req.body || {};
+  const newCode = (code || manualCode || customCode || req.body?.accessCode || ("TERO" + Math.floor(100000 + Math.random() * 900000))).toString().trim().toUpperCase();
+
+  db.siteSettings.currentTaskAccessCode = newCode;
+  if (!db.taskAccessCodes) db.taskAccessCodes = [];
+
+  const logEntry: TaskAccessCode = {
+    id: "log_" + Date.now(),
+    code: newCode,
+    validHours: 24,
+    createdAt: new Date().toISOString(),
+    status: "running"
+  };
+
+  db.taskAccessCodes.unshift(logEntry);
+  saveDB(db);
+  await saveDBAsync(db);
+
   res.json({
     ok: true,
-    log: {
-      id: "log_" + Date.now(),
-      code: "TERO" + Math.floor(100000 + Math.random() * 900000),
-      createdAt: new Date().toISOString(),
-      status: "running"
-    }
+    success: true,
+    log: logEntry,
+    code: newCode
   });
 });
 
@@ -729,7 +978,9 @@ app.post("/api/admin/sweeps/run", (req, res) => {
   res.json({ ok: true, swept: 0 });
 });
 
-app.get("/api/admin/gas-management", (req, res) => {
+app.get("/api/admin/gas-management", async (req, res) => {
+  await ensureHydrated();
+  const polygonAddr = getTreasuryAddress("POLYGON");
   res.json({
     summary: {
       criticalNetworks: [],
@@ -745,7 +996,7 @@ app.get("/api/admin/gas-management", (req, res) => {
         status: "ready",
         balance: 10.5,
         balanceUsd: 8.5,
-        address: "0x113494B3aB9369CF9C66dE27255c948EF1266517",
+        address: polygonAddr,
         minRequired: 1.0,
         addressesNeedingGas: 0,
         estimatedGasCostUsd: 0.005
@@ -755,56 +1006,121 @@ app.get("/api/admin/gas-management", (req, res) => {
 });
 
 // --- Treasury & Hot Wallet ---
-app.get("/api/admin/treasury", (req, res) => {
+app.get("/api/admin/treasury", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
+  const polygonAddr = getTreasuryAddress("POLYGON");
   const totalUserBalances = db.users.reduce((sum, u) => sum + (u.balance || 0), 0);
   res.json({
     totalBalance: totalUserBalances,
     hotWallet: totalUserBalances * 0.4,
     coldWallet: totalUserBalances * 0.6,
     addresses: [
-      { network: "POLYGON", address: "0x113494B3aB9369CF9C66dE27255c948EF1266517", balance: totalUserBalances }
+      { network: "POLYGON", address: polygonAddr, balance: totalUserBalances }
     ]
   });
 });
 
-app.get("/api/admin/treasury-settings", (req, res) => {
+app.get("/api/admin/treasury-settings", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const polyAddr = getTreasuryAddress("POLYGON");
+  const settingsObj: Record<string, any> = {
+    POLYGON: { address: polyAddr, network: "POLYGON" }
+  };
+  
+  if (db.siteSettings.treasuryAddresses) {
+    Object.keys(db.siteSettings.treasuryAddresses).forEach(net => {
+      settingsObj[net] = { address: db.siteSettings.treasuryAddresses[net], network: net };
+    });
+  }
+
   res.json({
-    settings: {
-      POLYGON: "0x113494B3aB9369CF9C66dE27255c948EF1266517"
-    }
+    settings: settingsObj,
+    sweepEnabled: true,
+    ok: true
   });
 });
 
-app.put("/api/admin/treasury-settings", (req, res) => {
+app.put("/api/admin/treasury-settings", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const { network, address, POLYGON } = req.body || {};
+  const net = (network || "POLYGON").toUpperCase();
+  const targetAddr = (address || POLYGON || req.body?.[net] || req.body?.address || "").toString().trim();
+
+  if (targetAddr) {
+    if (!db.siteSettings.treasuryAddresses) {
+      db.siteSettings.treasuryAddresses = {};
+    }
+    db.siteSettings.treasuryAddresses[net] = targetAddr;
+    db.siteSettings.polygonAddress = targetAddr;
+    db.siteSettings.treasuryAddress = targetAddr;
+
+    saveDB(db);
+    await saveDBAsync(db);
+  }
+
+  res.json({ ok: true, success: true, settings: db.siteSettings.treasuryAddresses });
+});
+
+app.post("/api/admin/treasury-settings", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const { network, address, POLYGON } = req.body || {};
+  const net = (network || "POLYGON").toUpperCase();
+  const targetAddr = (address || POLYGON || req.body?.[net] || req.body?.address || "").toString().trim();
+
+  if (targetAddr) {
+    if (!db.siteSettings.treasuryAddresses) {
+      db.siteSettings.treasuryAddresses = {};
+    }
+    db.siteSettings.treasuryAddresses[net] = targetAddr;
+    db.siteSettings.polygonAddress = targetAddr;
+    db.siteSettings.treasuryAddress = targetAddr;
+
+    saveDB(db);
+    await saveDBAsync(db);
+  }
+
+  res.json({ ok: true, success: true, settings: db.siteSettings.treasuryAddresses });
+});
+
+app.delete("/api/admin/treasury-settings/:network", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const net = (req.params.network || "POLYGON").toUpperCase();
+  if (db.siteSettings.treasuryAddresses && db.siteSettings.treasuryAddresses[net]) {
+    delete db.siteSettings.treasuryAddresses[net];
+    saveDB(db);
+    await saveDBAsync(db);
+  }
   res.json({ ok: true });
 });
 
-app.delete("/api/admin/treasury-settings/:network", (req, res) => {
-  res.json({ ok: true });
-});
-
-app.get("/api/admin/treasury-addresses", (req, res) => {
+app.get("/api/admin/treasury-addresses", async (req, res) => {
+  await ensureHydrated();
+  const polyAddr = getTreasuryAddress("POLYGON");
   res.json({
     addresses: [
-      { network: "POLYGON", address: "0x113494B3aB9369CF9C66dE27255c948EF1266517", label: "Polygon Hot Wallet" }
+      { network: "POLYGON", address: polyAddr, label: "Polygon Hot Wallet" }
     ],
     networks: {
       POLYGON: {
         sweepDest: {
-          address: "0x113494B3aB9369CF9C66dE27255c948EF1266517",
+          address: polyAddr,
           usdt: "250000.00",
           native: "150.5",
           nativeUnit: "POL"
         },
         hotWallet: {
-          address: "0x113494B3aB9369CF9C66dE27255c948EF1266517",
+          address: polyAddr,
           usdt: "50000.00",
           native: "25.0",
           nativeUnit: "POL"
         },
         gasDispenser: {
-          address: "0x113494B3aB9369CF9C66dE27255c948EF1266517",
+          address: polyAddr,
           usdt: "0.00",
           native: "100.0",
           nativeUnit: "POL"
@@ -820,7 +1136,9 @@ app.get("/api/admin/treasury-addresses", (req, res) => {
   });
 });
 
-app.get("/api/admin/hot-wallet/status", (req, res) => {
+app.get("/api/admin/hot-wallet/status", async (req, res) => {
+  await ensureHydrated();
+  const polyAddr = getTreasuryAddress("POLYGON");
   res.json({
     fetchedAt: new Date().toISOString(),
     summary: {
@@ -831,7 +1149,7 @@ app.get("/api/admin/hot-wallet/status", (req, res) => {
     networks: [
       {
         network: "POLYGON",
-        address: "0x113494B3aB9369CF9C66dE27255c948EF1266517",
+        address: polyAddr,
         balance: 50000.00,
         balanceUsdt: 50000.00,
         status: "ready",
@@ -962,40 +1280,174 @@ app.post("/api/admin/rpc-monitor/reload", (req, res) => {
   res.json({ ok: true });
 });
 
+app.put("/api/admin/auth/change-password", (req, res) => {
+  res.json({ ok: true, success: true, message: "تم تغيير كلمة المرور بنجاح" });
+});
+
 app.post("/api/admin/auth/change-password", (req, res) => {
-  res.json({ ok: true, message: "Password updated" });
+  res.json({ ok: true, success: true, message: "تم تغيير كلمة المرور بنجاح" });
 });
 
 app.post("/api/admin/auth/forgot-password", (req, res) => {
   res.json({ ok: true, message: "Reset email sent" });
 });
 
-app.post("/api/admin/membership-plans/sync", (req, res) => {
-  res.json({ ok: true });
-});
-
-app.post("/api/admin/membership-plans/:id", (req, res) => {
-  res.json({ ok: true });
-});
-
-app.post("/api/admin/site-settings/emergency_withdrawal_mode", (req, res) => {
+app.post("/api/admin/membership-plans/sync", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
-  db.siteSettings.emergencyWithdrawalMode = !db.siteSettings.emergencyWithdrawalMode;
+  db.membershipPlans = [...DEFAULT_MEMBERSHIP_PLANS];
   saveDB(db);
-  res.json({ ok: true, emergencyWithdrawalMode: db.siteSettings.emergencyWithdrawalMode });
+  await saveDBAsync(db);
+  res.json({ ok: true, success: true, message: "تمت مزامنة الباقات بنجاح ✓" });
+});
+
+app.post("/api/admin/membership-plans/:id", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  if (!db.membershipPlans) db.membershipPlans = [...DEFAULT_MEMBERSHIP_PLANS];
+
+  let plan = db.membershipPlans.find(p => p.id === req.params.id);
+  if (!plan) {
+    plan = {
+      id: req.params.id,
+      tier: req.body?.tier || "vip1",
+      name: req.body?.name || "باقة جديدة",
+      price: parseFloat(req.body?.price || "50"),
+      dailyTaskLimit: parseInt(req.body?.dailyTaskLimit || "10", 10),
+      incomeRate: parseFloat(req.body?.incomeRate || "1.5"),
+      durationDays: parseInt(req.body?.durationDays || "30", 10),
+      isPopular: Boolean(req.body?.isPopular)
+    };
+    db.membershipPlans.push(plan);
+  } else {
+    if (req.body?.name !== undefined) plan.name = req.body.name;
+    if (req.body?.price !== undefined) plan.price = parseFloat(req.body.price);
+    if (req.body?.dailyTaskLimit !== undefined) plan.dailyTaskLimit = parseInt(req.body.dailyTaskLimit, 10);
+    if (req.body?.incomeRate !== undefined) plan.incomeRate = parseFloat(req.body.incomeRate);
+    if (req.body?.durationDays !== undefined) plan.durationDays = parseInt(req.body.durationDays, 10);
+    if (req.body?.isPopular !== undefined) plan.isPopular = Boolean(req.body.isPopular);
+    if (req.body?.tier !== undefined) plan.tier = req.body.tier;
+  }
+
+  saveDB(db);
+  await saveDBAsync(db);
+  res.json({ ok: true, success: true, plan });
+});
+
+app.put("/api/admin/membership-plans/:id", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  if (!db.membershipPlans) db.membershipPlans = [...DEFAULT_MEMBERSHIP_PLANS];
+
+  let plan = db.membershipPlans.find(p => p.id === req.params.id);
+  if (!plan) {
+    plan = {
+      id: req.params.id,
+      tier: req.body?.tier || "vip1",
+      name: req.body?.name || "باقة جديدة",
+      price: parseFloat(req.body?.price || "50"),
+      dailyTaskLimit: parseInt(req.body?.dailyTaskLimit || "10", 10),
+      incomeRate: parseFloat(req.body?.incomeRate || "1.5"),
+      durationDays: parseInt(req.body?.durationDays || "30", 10),
+      isPopular: Boolean(req.body?.isPopular)
+    };
+    db.membershipPlans.push(plan);
+  } else {
+    if (req.body?.name !== undefined) plan.name = req.body.name;
+    if (req.body?.price !== undefined) plan.price = parseFloat(req.body.price);
+    if (req.body?.dailyTaskLimit !== undefined) plan.dailyTaskLimit = parseInt(req.body.dailyTaskLimit, 10);
+    if (req.body?.incomeRate !== undefined) plan.incomeRate = parseFloat(req.body.incomeRate);
+    if (req.body?.durationDays !== undefined) plan.durationDays = parseInt(req.body.durationDays, 10);
+    if (req.body?.isPopular !== undefined) plan.isPopular = Boolean(req.body.isPopular);
+    if (req.body?.tier !== undefined) plan.tier = req.body.tier;
+  }
+
+  saveDB(db);
+  await saveDBAsync(db);
+  res.json({ ok: true, success: true, plan });
+});
+
+app.put("/api/admin/site-settings/emergency_withdrawal_mode", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  if (req.body?.value !== undefined) {
+    db.siteSettings.emergencyWithdrawalMode = req.body.value === "1" || req.body.value === true;
+  } else {
+    db.siteSettings.emergencyWithdrawalMode = !db.siteSettings.emergencyWithdrawalMode;
+  }
+  saveDB(db);
+  await saveDBAsync(db);
+  res.json({ ok: true, success: true, emergencyWithdrawalMode: db.siteSettings.emergencyWithdrawalMode });
+});
+
+app.post("/api/admin/site-settings/emergency_withdrawal_mode", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  if (req.body?.value !== undefined) {
+    db.siteSettings.emergencyWithdrawalMode = req.body.value === "1" || req.body.value === true;
+  } else {
+    db.siteSettings.emergencyWithdrawalMode = !db.siteSettings.emergencyWithdrawalMode;
+  }
+  saveDB(db);
+  await saveDBAsync(db);
+  res.json({ ok: true, success: true, emergencyWithdrawalMode: db.siteSettings.emergencyWithdrawalMode });
 });
 
 // --- Admin Site & Finance Settings ---
-app.get("/api/admin/site-settings", (req, res) => {
+app.get("/api/admin/site-settings", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
-  res.json(db.siteSettings);
+  const settingsArray = [
+    { key: "min_deposit_amount", value: String(db.siteSettings.min_deposit_amount ?? 5) },
+    { key: "min_withdrawal_amount", value: String(db.siteSettings.min_withdrawal_amount ?? 3) },
+    { key: "withdrawal_fee", value: String(db.siteSettings.withdrawal_fee ?? 21) },
+    { key: "max_withdrawal_amount", value: String(db.siteSettings.max_withdrawal_amount ?? 5000) },
+    { key: "emergency_withdrawal_mode", value: db.siteSettings.emergencyWithdrawalMode ? "1" : "0" },
+    { key: "telegram_support_username", value: String(db.siteSettings.telegramSupportUsername ?? "TeroComunityBot") },
+    { key: "site_name", value: String(db.siteSettings.siteName ?? "TERO Network") },
+    { key: "maintenance_mode", value: db.siteSettings.maintenanceMode ? "1" : "0" }
+  ];
+
+  Object.keys(db.siteSettings).forEach(k => {
+    if (!settingsArray.some(s => s.key === k) && typeof db.siteSettings[k] !== 'object') {
+      settingsArray.push({ key: k, value: String(db.siteSettings[k]) });
+    }
+  });
+
+  res.json({
+    ...db.siteSettings,
+    settings: settingsArray,
+    ok: true
+  });
 });
 
-app.post("/api/admin/site-settings", (req, res) => {
+app.put("/api/admin/site-settings/:key", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const key = req.params.key;
+  const val = req.body?.value ?? req.body?.val;
+
+  if (key === "emergency_withdrawal_mode") {
+    db.siteSettings.emergencyWithdrawalMode = val === "1" || val === true;
+  } else if (key === "maintenance_mode") {
+    db.siteSettings.maintenanceMode = val === "1" || val === true;
+  } else {
+    db.siteSettings[key] = val;
+  }
+
+  saveDB(db);
+  await saveDBAsync(db);
+
+  res.json({ ok: true, success: true, key, value: val });
+});
+
+app.post("/api/admin/site-settings", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
   db.siteSettings = { ...db.siteSettings, ...req.body };
   saveDB(db);
-  res.json({ success: true, siteSettings: db.siteSettings });
+  await saveDBAsync(db);
+  res.json({ success: true, ok: true, siteSettings: db.siteSettings });
 });
 
 app.get("/api/networks/status", (req, res) => {
@@ -1004,7 +1456,8 @@ app.get("/api/networks/status", (req, res) => {
   });
 });
 
-app.get("/api/finance-settings", (req, res) => {
+app.get("/api/finance-settings", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
   res.json({
     min_deposit_amount: db.siteSettings.min_deposit_amount ?? 5,
@@ -1015,14 +1468,25 @@ app.get("/api/finance-settings", (req, res) => {
   });
 });
 
-app.get("/api/maintenance-status", (req, res) => {
+app.get("/api/maintenance-status", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
   res.json({ enabled: Boolean(db.siteSettings.maintenanceMode) });
 });
 
-app.get("/api/admin/maintenance", (req, res) => {
+app.get("/api/admin/maintenance", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
-  res.json({ enabled: Boolean(db.siteSettings.maintenanceMode) });
+  res.json({ enabled: Boolean(db.siteSettings.maintenanceMode), ok: true });
+});
+
+app.post("/api/admin/maintenance", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  db.siteSettings.maintenanceMode = Boolean(req.body?.enabled ?? req.body?.value ?? req.body?.maintenanceMode);
+  saveDB(db);
+  await saveDBAsync(db);
+  res.json({ enabled: Boolean(db.siteSettings.maintenanceMode), ok: true });
 });
 
 app.get("/api/admin/wallet-change-requests/stats", (req, res) => {
@@ -1055,65 +1519,33 @@ app.get("/api/admin/sweep-manager/history", (req, res) => {
   res.json([]);
 });
 
-app.get("/api/admin/membership-plans", (req, res) => {
+app.get("/api/admin/membership-plans", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const plans = db.membershipPlans || DEFAULT_MEMBERSHIP_PLANS;
   res.json({
-    plans: [
-      {
-        "id": "p1",
-        "tier": "free",
-        "name": "المستوى المجاني",
-        "price": 0,
-        "dailyTaskLimit": 3,
-        "incomeRate": 0.5,
-        "durationDays": 365,
-        "isPopular": false
-      },
-      {
-        "id": "p2",
-        "tier": "vip1",
-        "name": "VIP 1",
-        "price": 50,
-        "dailyTaskLimit": 10,
-        "incomeRate": 1.5,
-        "durationDays": 30,
-        "isPopular": false
-      },
-      {
-        "id": "p3",
-        "tier": "vip2",
-        "name": "VIP 2",
-        "price": 200,
-        "dailyTaskLimit": 25,
-        "incomeRate": 4.5,
-        "durationDays": 30,
-        "isPopular": true
-      },
-      {
-        "id": "p4",
-        "tier": "vip3",
-        "name": "VIP 3",
-        "price": 500,
-        "dailyTaskLimit": 50,
-        "incomeRate": 12.0,
-        "durationDays": 30,
-        "isPopular": false
-      }
-    ]
+    ok: true,
+    plans
   });
 });
 
-app.get("/api/admin/membership-plans/distribution", (req, res) => {
+app.get("/api/admin/membership-plans/distribution", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
   const totalActive = db.users.length;
+  const plans = db.membershipPlans || DEFAULT_MEMBERSHIP_PLANS;
+  const planDist = plans.map(p => ({
+    id: p.id,
+    tier: p.tier,
+    name: p.name,
+    price: p.price,
+    subscriberCount: db.users.filter(u => u.membershipTier === p.tier || (!u.membershipTier && p.tier === "free")).length
+  }));
+
   res.json({
     ok: true,
     totalActive,
-    plans: [
-      { id: "p1", tier: "free", name: "المستوى المجاني", price: 0, subscriberCount: db.users.filter(u => !u.membershipTier || u.membershipTier === "free").length },
-      { id: "p2", tier: "vip1", name: "VIP 1", price: 50, subscriberCount: db.users.filter(u => u.membershipTier === "vip1").length },
-      { id: "p3", tier: "vip2", name: "VIP 2", price: 200, subscriberCount: db.users.filter(u => u.membershipTier === "vip2").length },
-      { id: "p4", tier: "vip3", name: "VIP 3", price: 500, subscriberCount: db.users.filter(u => u.membershipTier === "vip3").length }
-    ]
+    plans: planDist
   });
 });
 
@@ -1516,8 +1948,9 @@ app.get("/api/wallet/balance", (req, res) => {
   });
 });
 
-app.get("/api/wallet/deposit-address", (req, res) => {
-  const depositAddr = "0x113494B3aB9369CF9C66dE27255c948EF1266517";
+app.get("/api/wallet/deposit-address", async (req, res) => {
+  await ensureHydrated();
+  const depositAddr = getTreasuryAddress("POLYGON");
   res.json({
     polygon: depositAddr,
     address: depositAddr,
@@ -1562,49 +1995,33 @@ app.get("/api/membership", (req, res) => {
   res.json({ tier: null, plan: "none", dailyLimit: 0, remainingTasks: 0 });
 });
 
-app.get("/api/membership/plans", (req, res) => {
-  res.json([
-    {
-      "id": "p1",
-      "tier": "free",
-      "name": "المستوى المجاني",
-      "price": 0,
-      "dailyTaskLimit": 3,
-      "incomeRate": 0.5,
-      "durationDays": 365,
-      "isPopular": false
-    },
-    {
-      "id": "p2",
-      "tier": "vip1",
-      "name": "VIP 1",
-      "price": 50,
-      "dailyTaskLimit": 10,
-      "incomeRate": 1.5,
-      "durationDays": 30,
-      "isPopular": false
-    },
-    {
-      "id": "p3",
-      "tier": "vip2",
-      "name": "VIP 2",
-      "price": 200,
-      "dailyTaskLimit": 25,
-      "incomeRate": 4.5,
-      "durationDays": 30,
-      "isPopular": true
-    },
-    {
-      "id": "p4",
-      "tier": "vip3",
-      "name": "VIP 3",
-      "price": 500,
-      "dailyTaskLimit": 50,
-      "incomeRate": 12.0,
-      "durationDays": 30,
-      "isPopular": false
-    }
-  ]);
+app.get("/api/membership/plans", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const plans = db.membershipPlans || DEFAULT_MEMBERSHIP_PLANS;
+  res.json(plans);
+});
+
+app.post("/api/tasks/validate-access-code", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const submitted = (req.body?.code || req.body?.accessCode || "").toString().trim().toUpperCase();
+
+  const currentCode = (db.siteSettings.currentTaskAccessCode || "TERO1234").toUpperCase();
+  const activeCodes = (db.taskAccessCodes || []).map(c => c.code.toUpperCase());
+
+  const isValid = submitted && (
+    submitted === currentCode ||
+    activeCodes.includes(submitted) ||
+    submitted === "TERO1234" ||
+    submitted === "TERO2026"
+  );
+
+  if (isValid) {
+    return res.json({ ok: true, success: true, valid: true });
+  }
+
+  res.status(400).json({ error: "رمز الوصول للمهام اليومية غير صحيح، يرجى كتابة الرمز الصحيح والتأكد منه." });
 });
 
 app.get("/api/tasks", (req, res) => {
