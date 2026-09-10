@@ -96,7 +96,7 @@ interface Withdrawal {
   status: "pending_approval" | "under_inspection" | "completed" | "failed" | "rejected" | "cancelled";
   createdAt: string;
   rejectionReason?: string;
-}
+}م
 
 interface Task {
   id: string;
