@@ -11,7 +11,7 @@
   "dependencies": {
     "@resvg/resvg-js": "^2.6.2",
     "express": "^4.21.2",
-    "firebase": "^12.18.0"
+    "firebase-admin": "^12.7.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",

@@ -1,21 +1,104 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { initializeApp } from "firebase/app";
-import {
-  initializeFirestore,
-  getFirestore,
-  collection,
-  doc,
-  getDocs,
-  getDoc,
-  setDoc,
-  deleteDoc,
-  Firestore
-} from "firebase/firestore";
+import crypto from "crypto";
+import admin from "firebase-admin";
 
 const app = express();
 const PORT = 3000;
+
+// =====================================================================
+// SECURITY: password hashing + signed session tokens
+// =====================================================================
+// Passwords are hashed with scrypt (Node's built-in, no extra dependency).
+// Tokens are HMAC-signed JSON — nobody can forge or edit one without
+// knowing SESSION_SECRET, unlike the old `base64(username)` "tokens".
+//
+// SESSION_SECRET must be set in production (env var). If it's missing we
+// generate a random one at boot so the app still runs in dev, but that
+// means every restart invalidates existing sessions — a deliberate
+// nudge to set a real secret before deploying.
+const SESSION_SECRET =
+  process.env.SESSION_SECRET ||
+  (() => {
+    const generated = crypto.randomBytes(32).toString("hex");
+    console.warn(
+      "[security] SESSION_SECRET is not set. Using a random secret for this " +
+      "process only — all sessions will be invalidated on restart. Set " +
+      "SESSION_SECRET in your environment before deploying to production."
+    );
+    return generated;
+  })();
+
+function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password: string, stored: string | undefined): boolean {
+  if (!stored || !stored.includes(":")) return false;
+  const [salt, hash] = stored.split(":");
+  const candidate = crypto.scryptSync(password, salt, 64).toString("hex");
+  try {
+    return crypto.timingSafeEqual(Buffer.from(hash, "hex"), Buffer.from(candidate, "hex"));
+  } catch {
+    return false;
+  }
+}
+
+function signToken(payload: Record<string, any>, expiresInSeconds = 60 * 60 * 24 * 7): string {
+  const body = { ...payload, exp: Date.now() + expiresInSeconds * 1000 };
+  const encoded = Buffer.from(JSON.stringify(body)).toString("base64url");
+  const sig = crypto.createHmac("sha256", SESSION_SECRET).update(encoded).digest("base64url");
+  return `${encoded}.${sig}`;
+}
+
+function verifyToken(token: string | undefined | null): Record<string, any> | null {
+  if (!token) return null;
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+  const [encoded, sig] = parts;
+  const expectedSig = crypto.createHmac("sha256", SESSION_SECRET).update(encoded).digest("base64url");
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig))) return null;
+  } catch {
+    return null;
+  }
+  try {
+    const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+    if (payload.exp && Date.now() > payload.exp) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function getBearerToken(req: express.Request): string | null {
+  const header = req.headers.authorization || "";
+  if (header.startsWith("Bearer ")) return header.slice(7).trim();
+  return null;
+}
+
+// Resolves the *real* logged-in user from a signed token. Previously every
+// "current user" endpoint (wallet balance, withdraw, profile, telegram
+// status...) either decoded an unsigned base64 token OR — for several
+// routes — just returned db.users[0] regardless of who was calling, so
+// every visitor saw the same account. That's fixed by always resolving
+// through this function.
+function getAuthenticatedUser(req: express.Request, db: DBData): User | null {
+  const payload = verifyToken(getBearerToken(req));
+  if (!payload || payload.role !== "user" || !payload.sub) return null;
+  return db.users.find(u => u.id === payload.sub) || null;
+}
+
+// Strips passwordHash before a user object goes out over the wire —
+// even to the admin panel, which is authenticated but still has no reason
+// to receive password hashes.
+function stripSensitive(user: User): Omit<User, "passwordHash"> {
+  const { passwordHash, ...safe } = user;
+  return safe;
+}
 
 // CORS middleware
 app.use((req, res, next) => {
@@ -39,17 +122,55 @@ app.use(express.static(process.cwd()));
 app.use(express.static(distDir));
 app.use(express.static(currentDir));
 
-// --- Firebase Cloud Firestore Initialization ---
-let firestoreDb: Firestore | null = null;
+// --- Firebase Cloud Firestore Initialization (Admin SDK) ---
+// IMPORTANT: this now uses firebase-admin with a service account, not the
+// client SDK. The client SDK was making the *server* subject to Firestore's
+// public security rules — combined with `allow read, write: if true` in
+// firestore.rules, that meant anyone on the internet could read/write the
+// database directly, bypassing this API entirely. The Admin SDK
+// authenticates as a trusted service account and always uses full
+// privileges regardless of security rules, so firestore.rules can (and
+// now does) deny all direct client access.
+//
+// You must provide a service account key — generate one from
+// Firebase Console → Project Settings → Service Accounts → Generate new
+// private key, then set FIREBASE_SERVICE_ACCOUNT_JSON to its full JSON
+// content (as a single env var string), or GOOGLE_APPLICATION_CREDENTIALS
+// to a path to the key file. Nothing here can guess that secret for you.
+let firestoreDb: admin.firestore.Firestore | null = null;
 try {
   const configPath = path.join(process.cwd(), "firebase-applet-config.json");
-  if (fs.existsSync(configPath)) {
-    const firebaseConfig = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    const firebaseApp = initializeApp(firebaseConfig);
-    firestoreDb = firebaseConfig.firestoreDatabaseId
-      ? initializeFirestore(firebaseApp, {}, firebaseConfig.firestoreDatabaseId)
-      : getFirestore(firebaseApp);
-    console.log("Firebase Firestore initialized successfully with database:", firebaseConfig.firestoreDatabaseId || "default");
+  const hasClientConfig = fs.existsSync(configPath);
+  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  const firebaseConfig = hasClientConfig
+    ? JSON.parse(fs.readFileSync(configPath, "utf-8"))
+    : {};
+
+  if (serviceAccountJson) {
+    const serviceAccount = JSON.parse(serviceAccountJson);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+      projectId: firebaseConfig.projectId || serviceAccount.project_id
+    });
+    firestoreDb = admin.firestore();
+    if (firebaseConfig.firestoreDatabaseId) {
+      firestoreDb = admin.firestore();
+      firestoreDb.settings({ databaseId: firebaseConfig.firestoreDatabaseId } as any);
+    }
+    console.log("Firebase Admin Firestore initialized with database:", firebaseConfig.firestoreDatabaseId || "default");
+  } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    admin.initializeApp({
+      credential: admin.credential.applicationDefault(),
+      projectId: firebaseConfig.projectId
+    });
+    firestoreDb = admin.firestore();
+    console.log("Firebase Admin Firestore initialized via GOOGLE_APPLICATION_CREDENTIALS.");
+  } else {
+    console.warn(
+      "[firestore] No service account provided (FIREBASE_SERVICE_ACCOUNT_JSON or " +
+      "GOOGLE_APPLICATION_CREDENTIALS). Running on local data.json only — cloud " +
+      "sync is disabled until credentials are supplied."
+    );
   }
 } catch (err) {
   console.error("Firebase initialization failed:", err);
@@ -62,6 +183,7 @@ interface User {
   id: string;
   username: string;
   email: string;
+  passwordHash?: string;
   telegram?: string;
   balance: number;
   usdtBalance: number;
@@ -202,6 +324,84 @@ let inMemoryDB: DBData = {
   }
 };
 
+// --- Admin credentials ---------------------------------------------------
+// No more hardcoded admin/admin123 in source. Credentials come from
+// ADMIN_USERNAME / ADMIN_PASSWORD env vars on first boot and are stored
+// hashed from then on (in data.json / Firestore, never in plaintext).
+// If the env vars are absent, a random one-time password is generated and
+// printed to the console so the app is still usable in local dev — but you
+// MUST capture it or set real env vars before deploying anywhere public.
+function ensureAdminAuthSeeded(db: DBData) {
+  if (db.siteSettings.adminAuth?.passwordHash) return;
+  const username = (process.env.ADMIN_USERNAME || "admin").trim().toLowerCase();
+  let password = process.env.ADMIN_PASSWORD;
+  let generated = false;
+  if (!password) {
+    password = crypto.randomBytes(9).toString("base64url");
+    generated = true;
+  }
+  db.siteSettings.adminAuth = {
+    username,
+    passwordHash: hashPassword(password)
+  };
+  if (generated) {
+    console.warn(
+      `[security] ADMIN_PASSWORD not set. Generated a one-time admin password ` +
+      `for user "${username}": ${password}\n` +
+      `Set ADMIN_USERNAME / ADMIN_PASSWORD env vars for a real deployment — ` +
+      `this generated password will be different on every restart.`
+    );
+  }
+}
+
+// --- Optional on-chain deposit verification (Polygon / USDT) -------------
+// Uses raw JSON-RPC (no extra SDK dependency) against POLYGON_RPC_URL.
+// Checks the transaction succeeded and includes an ERC-20 Transfer log
+// from the configured USDT contract, to the treasury address, for at
+// least the claimed amount. This only runs when POLYGON_RPC_URL is set —
+// without it deposits stay "pending" for manual admin review, same as
+// before.
+const USDT_POLYGON_CONTRACT = (process.env.USDT_CONTRACT_ADDRESS || "0xc2132D05D31c914a87C6611C10748AEb04B58e8").toLowerCase();
+const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+async function rpcCall(method: string, params: any[]): Promise<any> {
+  const rpcUrl = process.env.POLYGON_RPC_URL as string;
+  const resp = await fetch(rpcUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })
+  });
+  const json: any = await resp.json();
+  if (json.error) throw new Error(json.error.message || "RPC error");
+  return json.result;
+}
+
+async function verifyPolygonUsdtDeposit(
+  txHash: string,
+  treasuryAddress: string,
+  claimedAmount: number
+): Promise<{ ok: boolean; reason?: string }> {
+  const receipt = await rpcCall("eth_getTransactionReceipt", [txHash]);
+  if (!receipt) return { ok: false, reason: "transaction not found (not mined yet?)" };
+  if (receipt.status !== "0x1") return { ok: false, reason: "transaction reverted" };
+
+  const targetTopic = "0x" + treasuryAddress.toLowerCase().replace(/^0x/, "").padStart(64, "0");
+  const transferLog = (receipt.logs || []).find((log: any) =>
+    log.address?.toLowerCase() === USDT_POLYGON_CONTRACT &&
+    log.topics?.[0]?.toLowerCase() === ERC20_TRANSFER_TOPIC &&
+    log.topics?.[2]?.toLowerCase() === targetTopic
+  );
+  if (!transferLog) return { ok: false, reason: "no matching USDT transfer to treasury address found in tx logs" };
+
+  // USDT on Polygon uses 6 decimals.
+  const transferredRaw = BigInt(transferLog.data);
+  const transferredAmount = Number(transferredRaw) / 1_000_000;
+  if (transferredAmount + 0.000001 < claimedAmount) {
+    return { ok: false, reason: `on-chain amount ${transferredAmount} is less than claimed ${claimedAmount}` };
+  }
+  return { ok: true };
+}
+
 function getTreasuryAddress(net: string = "POLYGON"): string {
   const db = loadDB();
   const netKey = (net || "POLYGON").toUpperCase();
@@ -228,45 +428,52 @@ try {
   console.error("Error reading local data.json", e);
 }
 
+ensureAdminAuthSeeded(inMemoryDB);
+try {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(inMemoryDB, null, 2));
+} catch (e) {
+  console.error("Failed to persist seeded admin credentials", e);
+}
+
 // Async Hydrate from Cloud Firestore
 async function hydrateFromFirestore() {
   if (!firestoreDb) return;
   try {
     console.log("Hydrating data from Firebase Firestore...");
     // 1. Users
-    const usersSnap = await getDocs(collection(firestoreDb, "users"));
+    const usersSnap = await firestoreDb.collection("users").get();
     if (!usersSnap.empty) {
       inMemoryDB.users = usersSnap.docs.map(d => d.data() as User);
     }
 
     // 2. Deposits
-    const depositsSnap = await getDocs(collection(firestoreDb, "deposits"));
+    const depositsSnap = await firestoreDb.collection("deposits").get();
     if (!depositsSnap.empty) {
       inMemoryDB.deposits = depositsSnap.docs.map(d => d.data() as Deposit);
     }
 
     // 3. Withdrawals
-    const withdrawalsSnap = await getDocs(collection(firestoreDb, "withdrawals"));
+    const withdrawalsSnap = await firestoreDb.collection("withdrawals").get();
     if (!withdrawalsSnap.empty) {
       inMemoryDB.withdrawals = withdrawalsSnap.docs.map(d => d.data() as Withdrawal);
     }
 
     // 4. Tasks
-    const tasksSnap = await getDocs(collection(firestoreDb, "tasks"));
+    const tasksSnap = await firestoreDb.collection("tasks").get();
     if (!tasksSnap.empty) {
       inMemoryDB.tasks = tasksSnap.docs.map(d => d.data() as Task);
     }
 
     // 5. Site Settings
-    const settingsSnap = await getDoc(doc(firestoreDb, "siteSettings", "global"));
-    if (settingsSnap.exists()) {
-      const data = settingsSnap.data();
+    const settingsSnap = await firestoreDb.collection("siteSettings").doc("global").get();
+    if (settingsSnap.exists) {
+      const data = settingsSnap.data() as Record<string, any>;
       inMemoryDB.siteSettings = { ...inMemoryDB.siteSettings, ...data };
       if (data.membershipPlans) inMemoryDB.membershipPlans = data.membershipPlans;
       if (data.taskAccessCodes) inMemoryDB.taskAccessCodes = data.taskAccessCodes;
     } else {
       // Seed initial settings to Firestore
-      await setDoc(doc(firestoreDb, "siteSettings", "global"), {
+      await firestoreDb.collection("siteSettings").doc("global").set({
         ...inMemoryDB.siteSettings,
         membershipPlans: inMemoryDB.membershipPlans,
         taskAccessCodes: inMemoryDB.taskAccessCodes
@@ -305,7 +512,7 @@ function loadDB(): DBData {
 async function saveUserDirect(user: User) {
   if (firestoreDb && user && user.id) {
     try {
-      await setDoc(doc(firestoreDb, "users", user.id), user);
+      await firestoreDb.collection("users").doc(user.id).set(user);
     } catch (err) {
       console.error("Failed to save user directly to Firestore:", err);
     }
@@ -324,27 +531,27 @@ async function saveDBAsync(db: DBData) {
     try {
       for (const user of db.users) {
         if (user.id) {
-          await setDoc(doc(firestoreDb, "users", user.id), user);
+          await firestoreDb.collection("users").doc(user.id).set(user);
         }
       }
       for (const dep of db.deposits) {
         if (dep.id) {
-          await setDoc(doc(firestoreDb, "deposits", dep.id), dep);
+          await firestoreDb.collection("deposits").doc(dep.id).set(dep);
         }
       }
       for (const wd of db.withdrawals) {
         if (wd.id) {
-          await setDoc(doc(firestoreDb, "withdrawals", wd.id), wd);
+          await firestoreDb.collection("withdrawals").doc(wd.id).set(wd);
         }
       }
       for (const task of db.tasks) {
         if (task.id) {
-          await setDoc(doc(firestoreDb, "tasks", task.id), task);
+          await firestoreDb.collection("tasks").doc(task.id).set(task);
         }
       }
       db.siteSettings.membershipPlans = db.membershipPlans || DEFAULT_MEMBERSHIP_PLANS;
       db.siteSettings.taskAccessCodes = db.taskAccessCodes || [];
-      await setDoc(doc(firestoreDb, "siteSettings", "global"), db.siteSettings);
+      await firestoreDb.collection("siteSettings").doc("global").set(db.siteSettings);
     } catch (cloudErr) {
       console.error("Error writing to Firestore:", cloudErr);
     }
@@ -368,46 +575,80 @@ app.get("/api/health", (req, res) => {
 });
 
 // --- Admin Auth ---
-app.post("/api/admin/auth/login", (req, res) => {
+// Very small in-memory brute-force guard: 5 failed attempts per username
+// locks it out for 5 minutes. Resets on process restart — good enough to
+// stop naive credential-stuffing, not a substitute for a real WAF.
+const adminLoginAttempts = new Map<string, { count: number; lockedUntil: number }>();
+const ADMIN_LOGIN_MAX_ATTEMPTS = 5;
+const ADMIN_LOGIN_LOCKOUT_MS = 5 * 60 * 1000;
+
+app.post("/api/admin/auth/login", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  ensureAdminAuthSeeded(db);
+
   const { username, password } = req.body || {};
   const uname = (username || "").trim().toLowerCase();
-  const pass = (password || "").trim();
-  
-  const isValidUser = 
-    uname === "asd@gmail.com" ||
-    uname === "admin" || 
-    uname === "admin@tero.network" || 
-    uname === "admin@teronetwork.com";
+  const pass = (password || "").toString();
 
-  const isValidPass = 
-    pass === "123ASDasd" ||
-    pass === "admin123" || 
-    pass === "admin";
-  
-  if (isValidUser && isValidPass) {
-    const token = "admin_token_" + Buffer.from(uname).toString("base64");
-    res.json({
-      token,
-      username: uname,
-      role: "admin",
-      message: "Login successful"
-    });
+  const attempt = adminLoginAttempts.get(uname);
+  if (attempt && attempt.lockedUntil > Date.now()) {
+    const waitSec = Math.ceil((attempt.lockedUntil - Date.now()) / 1000);
+    return res.status(429).json({ error: `محاولات كثيرة فاشلة، حاول بعد ${waitSec} ثانية` });
+  }
+
+  const adminAuth = db.siteSettings.adminAuth;
+  const isValid = adminAuth && uname === adminAuth.username && verifyPassword(pass, adminAuth.passwordHash);
+
+  if (isValid) {
+    adminLoginAttempts.delete(uname);
+    const token = signToken({ sub: uname, role: "admin" });
+    res.json({ token, username: uname, role: "admin", message: "Login successful" });
   } else {
+    const next = attempt ? attempt.count + 1 : 1;
+    adminLoginAttempts.set(uname, {
+      count: next,
+      lockedUntil: next >= ADMIN_LOGIN_MAX_ATTEMPTS ? Date.now() + ADMIN_LOGIN_LOCKOUT_MS : 0
+    });
     res.status(401).json({ error: "اسم المستخدم أو كلمة المرور غير صحيحة" });
   }
 });
 
 app.get("/api/admin/auth/me", (req, res) => {
+  const payload = verifyToken(getBearerToken(req));
+  if (!payload || payload.role !== "admin") {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
   res.json({
-    username: "admin",
-    email: "admin@teronetwork.com",
+    username: payload.sub,
+    email: payload.sub.includes("@") ? payload.sub : `${payload.sub}@teronetwork.com`,
     role: "admin",
     authenticated: true
   });
 });
 
 app.post("/api/admin/auth/logout", (req, res) => {
+  // Stateless tokens — logout is handled client-side by discarding the
+  // token. Nothing to invalidate server-side without a session store.
   res.json({ success: true });
+});
+
+// --- Auth guard for every other /api/admin/* route -----------------------
+// Previously NONE of the ~120 admin endpoints below checked authentication
+// at all — anyone who found the URL could read every user, edit balances,
+// approve withdrawals, change treasury addresses, etc. This middleware
+// closes that gap for everything registered after this point.
+app.use("/api/admin", (req, res, next) => {
+  // Login/me/logout are handled above (before this middleware) and stay
+  // public; forgot-password must also stay public since the caller is,
+  // by definition, not logged in yet.
+  if (req.path === "/auth/forgot-password") return next();
+  const payload = verifyToken(getBearerToken(req));
+  if (!payload || payload.role !== "admin") {
+    return res.status(401).json({ error: "Unauthorized — admin login required" });
+  }
+  (req as any).admin = payload;
+  next();
 });
 
 // --- Admin Users Management ---
@@ -431,7 +672,7 @@ app.get("/api/admin/users", async (req, res) => {
   const paginated = filtered.slice(start, start + limit);
 
   res.json({
-    users: paginated,
+    users: paginated.map(stripSensitive),
     total: filtered.length
   });
 });
@@ -450,15 +691,14 @@ app.get("/api/admin/users/:id", (req, res) => {
   if (!user) {
     return res.status(404).json({ error: "User not found" });
   }
-  res.json({ user });
+  res.json({ user: stripSensitive(user) });
 });
 
 // Edit user / update balance / status
 app.post("/api/admin/users/:id", async (req, res) => {
   await ensureHydrated();
   const db = loadDB();
-  let user = db.users.find(u => u.id === req.params.id);
-  if (!user && db.users.length > 0) user = db.users[0];
+  const user = db.users.find(u => u.id === req.params.id);
   if (!user) {
     return res.status(404).json({ error: "User not found" });
   }
@@ -476,14 +716,13 @@ app.post("/api/admin/users/:id", async (req, res) => {
   saveDB(db);
   await saveUserDirect(user);
   await saveDBAsync(db);
-  res.json({ success: true, ok: true, user });
+  res.json({ success: true, ok: true, user: stripSensitive(user) });
 });
 
 app.put("/api/admin/users/:id", async (req, res) => {
   await ensureHydrated();
   const db = loadDB();
-  let user = db.users.find(u => u.id === req.params.id);
-  if (!user && db.users.length > 0) user = db.users[0];
+  const user = db.users.find(u => u.id === req.params.id);
   if (!user) {
     return res.status(404).json({ error: "User not found" });
   }
@@ -501,7 +740,26 @@ app.put("/api/admin/users/:id", async (req, res) => {
   saveDB(db);
   await saveUserDirect(user);
   await saveDBAsync(db);
-  res.json({ success: true, ok: true, user });
+  res.json({ success: true, ok: true, user: stripSensitive(user) });
+});
+
+// New: existing users (seeded via data.json before this fix) have no
+// password and can't log in under the new auth system until an admin
+// sets one for them.
+app.post("/api/admin/users/:id/set-password", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const user = db.users.find(u => u.id === req.params.id);
+  if (!user) return res.status(404).json({ error: "User not found" });
+
+  const newPassword = (req.body?.password || "").toString();
+  if (!newPassword || newPassword.length < 6) {
+    return res.status(400).json({ error: "كلمة المرور يجب أن تكون 6 أحرف على الأقل" });
+  }
+  user.passwordHash = hashPassword(newPassword);
+  saveDB(db);
+  await saveUserDirect(user);
+  res.json({ success: true, ok: true });
 });
 
 app.post("/api/admin/users/:id/freeze-inactivity", async (req, res) => {
@@ -853,9 +1111,21 @@ app.post("/api/admin/task-access-codes", async (req, res) => {
   const db = loadDB();
   const { code, manualCode, customCode, validHours } = req.body || {};
   const newCode = (code || manualCode || customCode || req.body?.accessCode || ("TAC_" + Math.floor(100000 + Math.random() * 900000))).toString().trim().toUpperCase();
-  
+
+  if (!newCode) {
+    return res.status(400).json({ error: "الرمز مطلوب" });
+  }
+
   db.siteSettings.currentTaskAccessCode = newCode;
   if (!db.taskAccessCodes) db.taskAccessCodes = [];
+
+  // Retire any previously-active codes so only the newest one validates —
+  // otherwise every code ever created stays valid forever (as long as it's
+  // still within its own validHours window), which defeats the point of
+  // rotating codes.
+  db.taskAccessCodes.forEach(c => {
+    if ((c.status || "running") === "running") c.status = "replaced";
+  });
 
   const entry: TaskAccessCode = {
     id: "tac_" + Date.now(),
@@ -870,6 +1140,30 @@ app.post("/api/admin/task-access-codes", async (req, res) => {
   await saveDBAsync(db);
 
   res.json({ ok: true, success: true, code: newCode, entry });
+});
+
+// New: edit an existing code's value/validHours in place (rather than
+// only being able to create a brand new one and delete the old one).
+app.put("/api/admin/task-access-codes/:id", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  if (!db.taskAccessCodes) db.taskAccessCodes = [];
+  const entry = db.taskAccessCodes.find(c => c.id === req.params.id);
+  if (!entry) return res.status(404).json({ error: "الرمز غير موجود" });
+
+  const { code, validHours, status } = req.body || {};
+  if (code) {
+    entry.code = code.toString().trim().toUpperCase();
+    if ((entry.status || "running") === "running") {
+      db.siteSettings.currentTaskAccessCode = entry.code;
+    }
+  }
+  if (validHours !== undefined) entry.validHours = parseInt(validHours, 10);
+  if (status) entry.status = status;
+
+  saveDB(db);
+  await saveDBAsync(db);
+  res.json({ ok: true, success: true, entry });
 });
 
 app.delete("/api/admin/task-access-codes/:id", async (req, res) => {
@@ -928,6 +1222,9 @@ app.post("/api/admin/task-code-gen/manual", async (req, res) => {
 
   db.siteSettings.currentTaskAccessCode = newCode;
   if (!db.taskAccessCodes) db.taskAccessCodes = [];
+  db.taskAccessCodes.forEach(c => {
+    if ((c.status || "running") === "running") c.status = "replaced";
+  });
 
   const logEntry: TaskAccessCode = {
     id: "log_" + Date.now(),
@@ -1021,6 +1318,10 @@ app.get("/api/admin/treasury", async (req, res) => {
   });
 });
 
+function isValidEvmAddress(addr: string): boolean {
+  return /^0x[a-fA-F0-9]{40}$/.test(addr);
+}
+
 app.get("/api/admin/treasury-settings", async (req, res) => {
   await ensureHydrated();
   const db = loadDB();
@@ -1049,17 +1350,24 @@ app.put("/api/admin/treasury-settings", async (req, res) => {
   const net = (network || "POLYGON").toUpperCase();
   const targetAddr = (address || POLYGON || req.body?.[net] || req.body?.address || "").toString().trim();
 
-  if (targetAddr) {
-    if (!db.siteSettings.treasuryAddresses) {
-      db.siteSettings.treasuryAddresses = {};
-    }
-    db.siteSettings.treasuryAddresses[net] = targetAddr;
-    db.siteSettings.polygonAddress = targetAddr;
-    db.siteSettings.treasuryAddress = targetAddr;
-
-    saveDB(db);
-    await saveDBAsync(db);
+  if (!targetAddr) {
+    return res.status(400).json({ error: "العنوان مطلوب" });
   }
+  // Was previously saved with no format check at all — a typo here
+  // silently breaks deposits for every user until someone notices.
+  if (net === "POLYGON" && !isValidEvmAddress(targetAddr)) {
+    return res.status(400).json({ error: "عنوان محفظة Polygon غير صالح، يجب أن يبدأ بـ 0x ويتكون من 42 حرفًا" });
+  }
+
+  if (!db.siteSettings.treasuryAddresses) {
+    db.siteSettings.treasuryAddresses = {};
+  }
+  db.siteSettings.treasuryAddresses[net] = targetAddr;
+  db.siteSettings.polygonAddress = targetAddr;
+  db.siteSettings.treasuryAddress = targetAddr;
+
+  saveDB(db);
+  await saveDBAsync(db);
 
   res.json({ ok: true, success: true, settings: db.siteSettings.treasuryAddresses });
 });
@@ -1071,17 +1379,22 @@ app.post("/api/admin/treasury-settings", async (req, res) => {
   const net = (network || "POLYGON").toUpperCase();
   const targetAddr = (address || POLYGON || req.body?.[net] || req.body?.address || "").toString().trim();
 
-  if (targetAddr) {
-    if (!db.siteSettings.treasuryAddresses) {
-      db.siteSettings.treasuryAddresses = {};
-    }
-    db.siteSettings.treasuryAddresses[net] = targetAddr;
-    db.siteSettings.polygonAddress = targetAddr;
-    db.siteSettings.treasuryAddress = targetAddr;
-
-    saveDB(db);
-    await saveDBAsync(db);
+  if (!targetAddr) {
+    return res.status(400).json({ error: "العنوان مطلوب" });
   }
+  if (net === "POLYGON" && !isValidEvmAddress(targetAddr)) {
+    return res.status(400).json({ error: "عنوان محفظة Polygon غير صالح، يجب أن يبدأ بـ 0x ويتكون من 42 حرفًا" });
+  }
+
+  if (!db.siteSettings.treasuryAddresses) {
+    db.siteSettings.treasuryAddresses = {};
+  }
+  db.siteSettings.treasuryAddresses[net] = targetAddr;
+  db.siteSettings.polygonAddress = targetAddr;
+  db.siteSettings.treasuryAddress = targetAddr;
+
+  saveDB(db);
+  await saveDBAsync(db);
 
   res.json({ ok: true, success: true, settings: db.siteSettings.treasuryAddresses });
 });
@@ -1280,16 +1593,38 @@ app.post("/api/admin/rpc-monitor/reload", (req, res) => {
   res.json({ ok: true });
 });
 
-app.put("/api/admin/auth/change-password", (req, res) => {
-  res.json({ ok: true, success: true, message: "تم تغيير كلمة المرور بنجاح" });
-});
+async function handleAdminChangePassword(req: express.Request, res: express.Response) {
+  await ensureHydrated();
+  const db = loadDB();
+  const { currentPassword, oldPassword, newPassword } = req.body || {};
+  const current = (currentPassword || oldPassword || "").toString();
+  const next = (newPassword || "").toString();
 
-app.post("/api/admin/auth/change-password", (req, res) => {
+  if (!next || next.length < 8) {
+    return res.status(400).json({ error: "كلمة المرور الجديدة يجب أن تكون 8 أحرف على الأقل" });
+  }
+  const adminAuth = db.siteSettings.adminAuth;
+  if (!adminAuth || !verifyPassword(current, adminAuth.passwordHash)) {
+    return res.status(401).json({ error: "كلمة المرور الحالية غير صحيحة" });
+  }
+  db.siteSettings.adminAuth = { ...adminAuth, passwordHash: hashPassword(next) };
+  saveDB(db);
   res.json({ ok: true, success: true, message: "تم تغيير كلمة المرور بنجاح" });
-});
+}
 
+app.put("/api/admin/auth/change-password", handleAdminChangePassword);
+app.post("/api/admin/auth/change-password", handleAdminChangePassword);
+
+// Note: this is a single-admin system with no email provider wired up, so
+// a real "email me a reset link" flow isn't possible yet. This intentionally
+// refuses rather than pretending to send an email, and tells the operator
+// how to actually reset it (env var), which is the truthful option available.
 app.post("/api/admin/auth/forgot-password", (req, res) => {
-  res.json({ ok: true, message: "Reset email sent" });
+  res.status(501).json({
+    error: "إعادة تعيين كلمة المرور عبر البريد غير مفعّلة بعد. لإعادة التعيين، " +
+      "شغّل السيرفر مع متغيرات البيئة ADMIN_USERNAME و ADMIN_PASSWORD الجديدة " +
+      "بعد حذف حقل adminAuth من data.json."
+  });
 });
 
 app.post("/api/admin/membership-plans/sync", async (req, res) => {
@@ -1414,8 +1749,11 @@ app.get("/api/admin/site-settings", async (req, res) => {
     }
   });
 
+  // NOTE: db.siteSettings.adminAuth (username + password hash) must never
+  // be sent to the client, even authenticated admin — stripped below.
+  const { adminAuth: _adminAuth, ...publicSettings } = db.siteSettings;
   res.json({
-    ...db.siteSettings,
+    ...publicSettings,
     settings: settingsArray,
     ok: true
   });
@@ -1426,6 +1764,12 @@ app.put("/api/admin/site-settings/:key", async (req, res) => {
   const db = loadDB();
   const key = req.params.key;
   const val = req.body?.value ?? req.body?.val;
+
+  // adminAuth can only change via /api/admin/auth/change-password, never
+  // through this generic key/value settings endpoint.
+  if (key === "adminAuth") {
+    return res.status(403).json({ error: "Forbidden" });
+  }
 
   if (key === "emergency_withdrawal_mode") {
     db.siteSettings.emergencyWithdrawalMode = val === "1" || val === true;
@@ -1444,10 +1788,17 @@ app.put("/api/admin/site-settings/:key", async (req, res) => {
 app.post("/api/admin/site-settings", async (req, res) => {
   await ensureHydrated();
   const db = loadDB();
-  db.siteSettings = { ...db.siteSettings, ...req.body };
+  // Same reasoning: block adminAuth from being overwritten through a bulk
+  // settings update — this used to spread the entire request body
+  // straight into siteSettings, so a stray {adminAuth: {...}} in the
+  // payload (buggy client or malicious request) could silently replace
+  // the admin password hash.
+  const { adminAuth: _ignoredAdminAuth, ...incomingSettings } = req.body || {};
+  db.siteSettings = { ...db.siteSettings, ...incomingSettings };
   saveDB(db);
   await saveDBAsync(db);
-  res.json({ success: true, ok: true, siteSettings: db.siteSettings });
+  const { adminAuth: _adminAuth2, ...publicSettings2 } = db.siteSettings;
+  res.json({ success: true, ok: true, siteSettings: publicSettings2 });
 });
 
 app.get("/api/networks/status", (req, res) => {
@@ -1591,9 +1942,10 @@ app.get("/api/admin/rpc-monitor", (req, res) => {
 // Admin User Specific Sub-routes
 app.get("/api/admin/users/:id/profile", (req, res) => {
   const db = loadDB();
-  const user = db.users.find(u => u.id === req.params.id) || db.users[0];
+  const user = db.users.find(u => u.id === req.params.id);
   if (!user) return res.status(404).json({ error: "User not found" });
-  res.json(user);
+  const { passwordHash, ...safeUser } = user;
+  res.json(safeUser);
 });
 
 app.get("/api/admin/users/:id/deposit-addresses", (req, res) => {
@@ -1621,21 +1973,33 @@ app.post("/api/admin/users/:id/rotate-deposit-address", (req, res) => {
 
 app.get("/api/admin/users/:id/deposits", (req, res) => {
   const db = loadDB();
-  const list = db.deposits.filter(d => d.userId === req.params.id || d.username === "asse_24");
+  // Fixed: this used to also always include a hardcoded "asse_24" user's
+  // deposits on every lookup regardless of which :id was requested.
+  const list = db.deposits.filter(d => d.userId === req.params.id);
   res.json({ transactions: list, total: list.length });
 });
 
 app.get("/api/admin/users/:id/withdrawals", (req, res) => {
   const db = loadDB();
-  const list = db.withdrawals.filter(w => w.userId === req.params.id || w.username === "asse_24");
+  const list = db.withdrawals.filter(w => w.userId === req.params.id);
   res.json({ transactions: list, total: list.length });
 });
 
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "8701414109:AAEDizxf0LQsX9sB519-WOnYxnm8jb3OJN4";
+// SECURITY: this token used to be hardcoded in source
+// ("8701414109:AAEDizxf0LQsX9sB519-WOnYxnm8jb3OJN4") — a live secret
+// committed to the repo lets anyone control the bot (send messages,
+// read updates) as this app. It's now required from the environment;
+// the Telegram integration simply stays off without it. Treat that old
+// token as compromised and rotate it via @BotFather regardless.
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME || "TeroComunityBot";
+if (!TELEGRAM_BOT_TOKEN) {
+  console.warn("[telegram] TELEGRAM_BOT_TOKEN not set — Telegram bot integration is disabled.");
+}
 
 // Telegram Bot Service for Auto-linking Accounts (@TeroComunityBot)
 async function processTelegramMessage(msg: any) {
+  if (!TELEGRAM_BOT_TOKEN) return;
   if (!msg || !msg.text) return;
   await ensureHydrated();
   const text = msg.text.trim();
@@ -1659,10 +2023,10 @@ async function processTelegramMessage(msg: any) {
         matchedUser = db.users.find(u => u.id === param || u.username === param);
       }
       
-      if (!matchedUser && db.users.length > 0) {
-        matchedUser = db.users[0];
-      }
-      
+      // No more falling back to db.users[0] — that used to link a random
+      // stranger's Telegram account to whichever user happened to be
+      // first in the database if the deep-link parameter didn't match
+      // anyone.
       if (matchedUser) {
         matchedUser.telegram = tgUsername;
         await saveUserDirect(matchedUser);
@@ -1743,118 +2107,104 @@ app.get("/api/site-settings/public/telegram_support_username", (req, res) => {
 app.post("/api/auth/register", async (req, res) => {
   await ensureHydrated();
   const db = loadDB();
-  const { phone, countryCode, countryIso, country, referralCode, password, language, email, username } = req.body || {};
+  const { phone, referralCode, password, email, username } = req.body || {};
 
   const cleanPhone = (phone || "").toString().trim();
   const cleanEmail = (email || "").toString().trim().toLowerCase();
   const cleanUsername = (username || cleanPhone || (cleanEmail ? cleanEmail.split("@")[0] : "") || ("user_" + Math.floor(100000 + Math.random() * 900000))).toString().trim();
+  const cleanPassword = (password || "").toString();
 
-  let user = db.users.find(u => 
+  if (!cleanPassword || cleanPassword.length < 6) {
+    return res.status(400).json({ error: "كلمة المرور يجب أن تكون 6 أحرف على الأقل" });
+  }
+
+  const existing = db.users.find(u =>
     (cleanPhone && u.username === cleanPhone) ||
     (cleanEmail && u.email === cleanEmail) ||
     (cleanUsername && u.username === cleanUsername)
   );
-
-  if (!user) {
-    user = {
-      id: "u_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
-      username: cleanUsername,
-      email: cleanEmail || (cleanPhone ? `${cleanPhone}@tero.com` : `${cleanUsername}@tero.com`),
-      telegram: "",
-      balance: 0.00,
-      usdtBalance: 0.00,
-      status: "active",
-      isFrozen: false,
-      joinedAt: new Date().toISOString(),
-      membershipPlan: "none",
-      referralsCount: 0,
-      membershipTier: "free",
-      referralCode: referralCode || ("TQ" + Math.floor(10000 + Math.random() * 90000))
-    };
-    db.users.unshift(user);
-    await saveUserDirect(user);
-    await saveDBAsync(db);
+  if (existing) {
+    return res.status(409).json({ error: "الحساب موجود مسبقًا، يرجى تسجيل الدخول" });
   }
 
-  const token = "user_token_" + Buffer.from(user.username).toString("base64");
-  res.json({
-    token,
-    user
-  });
+  const user: User = {
+    id: "u_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
+    username: cleanUsername,
+    email: cleanEmail || (cleanPhone ? `${cleanPhone}@tero.com` : `${cleanUsername}@tero.com`),
+    passwordHash: hashPassword(cleanPassword),
+    telegram: "",
+    balance: 0.00,
+    usdtBalance: 0.00,
+    status: "active",
+    isFrozen: false,
+    joinedAt: new Date().toISOString(),
+    membershipPlan: "none",
+    referralsCount: 0,
+    membershipTier: "free",
+    referralCode: "TQ" + Math.floor(10000 + Math.random() * 90000)
+  };
+  // referralCode in the request body is the code the NEW user was referred
+  // BY, not their own code — credit the referrer instead of overwriting it.
+  if (referralCode) {
+    const referrer = db.users.find(u => u.referralCode === referralCode);
+    if (referrer) referrer.referralsCount = (referrer.referralsCount || 0) + 1;
+  }
+  db.users.unshift(user);
+  await saveUserDirect(user);
+  await saveDBAsync(db);
+
+  const token = signToken({ sub: user.id, role: "user" });
+  const { passwordHash, ...safeUser } = user;
+  res.json({ token, user: safeUser });
 });
 
 app.post("/api/auth/login", async (req, res) => {
   await ensureHydrated();
   const db = loadDB();
-  const { username, identifier, email, phone } = req.body || {};
-  const uname = (username || identifier || email || phone || "asse_24").toString().trim();
-  let user = db.users.find(u => u.username.toLowerCase() === uname.toLowerCase() || u.email.toLowerCase() === uname.toLowerCase());
-  if (!user) {
-    user = {
-      id: "u_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
-      username: uname,
-      email: uname.includes("@") ? uname : `${uname}@tero.com`,
-      telegram: "",
-      balance: 0.00,
-      usdtBalance: 0.00,
-      status: "active",
-      isFrozen: false,
-      joinedAt: new Date().toISOString(),
-      membershipPlan: "none",
-      referralsCount: 0,
-      membershipTier: "free",
-      referralCode: "TQ" + Math.floor(10000 + Math.random() * 90000)
-    };
-    db.users.unshift(user);
-    await saveUserDirect(user);
-    await saveDBAsync(db);
+  const { username, identifier, email, phone, password } = req.body || {};
+  const uname = (username || identifier || email || phone || "").toString().trim();
+  const pass = (password || "").toString();
+
+  if (!uname || !pass) {
+    return res.status(400).json({ error: "الرجاء إدخال اسم المستخدم وكلمة المرور" });
   }
 
-  res.json({
-    token: "user_token_" + Buffer.from(user.username).toString("base64"),
-    user
-  });
+  const user = db.users.find(u =>
+    u.username.toLowerCase() === uname.toLowerCase() || u.email.toLowerCase() === uname.toLowerCase()
+  );
+
+  // Accounts created before this fix (or seeded via data.json) may have no
+  // passwordHash yet — they can no longer log in silently as before; an
+  // admin needs to set a password for them via the admin panel.
+  if (!user || !verifyPassword(pass, user.passwordHash)) {
+    return res.status(401).json({ error: "بيانات الدخول غير صحيحة" });
+  }
+
+  const token = signToken({ sub: user.id, role: "user" });
+  const { passwordHash, ...safeUser } = user;
+  res.json({ token, user: safeUser });
 });
 
 app.get("/api/auth/me", async (req, res) => {
   await ensureHydrated();
   const db = loadDB();
-  const authHeader = req.headers.authorization || "";
-  let user: User | undefined;
-  if (authHeader.startsWith("Bearer user_token_")) {
-    try {
-      const b64 = authHeader.replace("Bearer user_token_", "");
-      const uname = Buffer.from(b64, "base64").toString("utf8");
-      const found = db.users.find(u => u.username === uname || u.email === uname);
-      if (found) user = found;
-    } catch {}
-  }
-  
-  if (!user) user = db.users[0];
+  const user = getAuthenticatedUser(req, db);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
 
-  const isLinked = Boolean(user && user.telegram && user.telegram.trim() !== "");
-  res.json({
-    ...(user || { id: "u1", username: "asse_24", email: "asse_24@tero.com" }),
-    requiresTelegramLink: !isLinked
-  });
+  const isLinked = Boolean(user.telegram && user.telegram.trim() !== "");
+  const { passwordHash, ...safeUser } = user;
+  res.json({ ...safeUser, requiresTelegramLink: !isLinked });
 });
 
 app.get("/api/user/profile", async (req, res) => {
   await ensureHydrated();
   const db = loadDB();
-  const authHeader = req.headers.authorization || "";
-  let user: User | undefined;
-  if (authHeader.startsWith("Bearer user_token_")) {
-    try {
-      const b64 = authHeader.replace("Bearer user_token_", "");
-      const uname = Buffer.from(b64, "base64").toString("utf8");
-      const found = db.users.find(u => u.username === uname || u.email === uname);
-      if (found) user = found;
-    } catch {}
-  }
-  if (!user) user = (db.users[0] || { id: "u1", username: "asse_24", balance: 0.00, referralCode: "TQ69JZ" }) as User;
+  const user = getAuthenticatedUser(req, db);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  const { passwordHash, ...safeUser } = user;
   res.json({
-    ...user,
+    ...safeUser,
     referralCode: user.referralCode || "TQ69JZ",
     leaderRank: 0,
     leaderPoints: 0,
@@ -1866,44 +2216,25 @@ app.get("/api/user/profile", async (req, res) => {
 app.get("/api/user/telegram/status", async (req, res) => {
   await ensureHydrated();
   const db = loadDB();
-  const authHeader = req.headers.authorization || "";
-  let user: User | undefined;
-  if (authHeader.startsWith("Bearer user_token_")) {
-    try {
-      const b64 = authHeader.replace("Bearer user_token_", "");
-      const uname = Buffer.from(b64, "base64").toString("utf8");
-      const found = db.users.find(u => u.username === uname || u.email === uname);
-      if (found) user = found;
-    } catch {}
-  }
-  if (!user) user = db.users[0];
-  const isLinked = Boolean(user && user.telegram && user.telegram.trim() !== "");
-  res.json({ linked: isLinked, telegramUsername: user?.telegram || null });
+  const user = getAuthenticatedUser(req, db);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  const isLinked = Boolean(user.telegram && user.telegram.trim() !== "");
+  res.json({ linked: isLinked, telegramUsername: user.telegram || null });
 });
 
 app.post("/api/user/telegram/link-token", async (req, res) => {
   await ensureHydrated();
   const db = loadDB();
-  const authHeader = req.headers.authorization || "";
-  let user: User | undefined;
-  if (authHeader.startsWith("Bearer user_token_")) {
-    try {
-      const b64 = authHeader.replace("Bearer user_token_", "");
-      const uname = Buffer.from(b64, "base64").toString("utf8");
-      const found = db.users.find(u => u.username === uname || u.email === uname);
-      if (found) user = found;
-    } catch {}
-  }
-  if (!user) user = db.users[0];
-  
+  const user = getAuthenticatedUser(req, db);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
   const rawBotName = TELEGRAM_BOT_USERNAME || db.siteSettings.telegramSupportUsername || "TeroComunityBot";
   const cleanBotName = rawBotName.replace(/^@/, "");
-  const linkId = user?.id || "u1";
-  
+
   res.json({
     botUsername: cleanBotName,
-    deepLink: `https://t.me/${cleanBotName}?start=link_${linkId}`,
-    token: `token_${linkId}`
+    deepLink: `https://t.me/${cleanBotName}?start=link_${user.id}`,
+    token: `token_${user.id}`
   });
 });
 
@@ -1918,9 +2249,11 @@ app.post("/api/user/telegram/verify-link", async (req, res) => {
     targetId = token.replace("link_", "").replace("token_", "");
   }
   
-  let user = db.users.find(u => u.id === targetId || u.username === targetId);
-  if (!user && db.users.length > 0) user = db.users[0];
-  
+  // No fallback to db.users[0] here anymore — that used to silently link
+  // Telegram accounts to whichever user happened to be first in the list
+  // whenever the token/userId didn't match anyone.
+  const user = db.users.find(u => u.id === targetId || u.username === targetId);
+
   if (user) {
     user.telegram = telegramUsername || "@user_tg";
     await saveUserDirect(user);
@@ -1938,18 +2271,28 @@ app.post("/api/user/telegram/request-invite", (req, res) => {
   });
 });
 
-app.get("/api/wallet/balance", (req, res) => {
+app.get("/api/wallet/balance", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
-  const user = db.users[0];
+  const user = getAuthenticatedUser(req, db);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
   res.json({
-    balance: (user?.balance ?? 0.00).toFixed(2),
-    available: (user?.balance ?? 0.00).toFixed(2),
+    balance: (user.balance ?? 0.00).toFixed(2),
+    available: (user.balance ?? 0.00).toFixed(2),
     currency: "USDT"
   });
 });
 
 app.get("/api/wallet/deposit-address", async (req, res) => {
   await ensureHydrated();
+  const db = loadDB();
+  const user = getAuthenticatedUser(req, db);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  // NOTE: every user shares the same site-wide treasury deposit address.
+  // Because it's shared, a deposit can't be tied to a user just by address
+  // — /api/wallet/deposit below requires the user to submit their tx hash
+  // so it can be recorded (and, if RPC verification is configured,
+  // checked) against their account specifically.
   const depositAddr = getTreasuryAddress("POLYGON");
   res.json({
     polygon: depositAddr,
@@ -1958,24 +2301,102 @@ app.get("/api/wallet/deposit-address", async (req, res) => {
   });
 });
 
-app.post("/api/wallet/withdraw", (req, res) => {
+// Was missing entirely — the UI has a deposit flow but nothing recorded a
+// user's deposit submission anywhere before an admin could see or approve
+// it. This creates the pending deposit, and — if POLYGON_RPC_URL is set —
+// verifies on-chain that the tx really is a USDT transfer to the treasury
+// address for at least the claimed amount before flagging it for review.
+app.post("/api/wallet/deposit", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
+  const user = getAuthenticatedUser(req, db);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  const { amount, txHash, network } = req.body || {};
+  const amt = (amount || "").toString().trim();
+  const hash = (txHash || "").toString().trim();
+  const net = (network || "POLYGON").toString().toUpperCase();
+  const minDeposit = parseFloat(db.siteSettings.min_deposit_amount || "10");
+
+  if (!hash || !/^0x[a-fA-F0-9]{64}$/.test(hash)) {
+    return res.status(400).json({ error: "رقم المعاملة (txHash) غير صالح" });
+  }
+  if (!amt || isNaN(parseFloat(amt)) || parseFloat(amt) < minDeposit) {
+    return res.status(400).json({ error: `الحد الأدنى للإيداع هو ${minDeposit} USDT` });
+  }
+  if (db.deposits.some(d => d.txHash.toLowerCase() === hash.toLowerCase())) {
+    return res.status(409).json({ error: "تم استخدام هذه المعاملة من قبل" });
+  }
+
+  const deposit: Deposit = {
+    id: "dep_" + Date.now(),
+    userId: user.id,
+    username: user.username,
+    amount: amt,
+    network: net,
+    status: "pending",
+    txHash: hash,
+    createdAt: new Date().toISOString()
+  };
+
+  if (net === "POLYGON" && process.env.POLYGON_RPC_URL) {
+    try {
+      const verification = await verifyPolygonUsdtDeposit(hash, getTreasuryAddress("POLYGON"), parseFloat(amt));
+      if (verification.ok) {
+        deposit.status = "confirmed";
+      } else {
+        console.warn(`[deposit] on-chain verification failed for ${hash}: ${verification.reason}`);
+      }
+    } catch (err) {
+      console.error("[deposit] on-chain verification error:", err);
+    }
+  }
+
+  db.deposits.unshift(deposit);
+  if (deposit.status === "confirmed") {
+    user.balance += parseFloat(amt);
+    user.usdtBalance += parseFloat(amt);
+  }
+  saveDB(db);
+  await saveUserDirect(user);
+
+  res.json({ success: true, deposit });
+});
+
+app.post("/api/wallet/withdraw", async (req, res) => {
+  await ensureHydrated();
+  const db = loadDB();
+  const user = getAuthenticatedUser(req, db);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
   const { amount, address, network } = req.body || {};
   const amt = parseFloat(amount || "0");
-  const user = db.users[0];
+  const minWithdraw = parseFloat(db.siteSettings.min_withdrawal_amount ?? 3);
+  const maxWithdraw = parseFloat(db.siteSettings.max_withdrawal_amount ?? 5000);
 
-  if (user && user.balance >= amt) {
-    user.balance -= amt;
-    user.usdtBalance -= amt;
+  if (!address || !amt || amt <= 0) {
+    return res.status(400).json({ error: "بيانات السحب غير مكتملة" });
   }
+  if (amt < minWithdraw || amt > maxWithdraw) {
+    return res.status(400).json({ error: `مبلغ السحب يجب أن يكون بين ${minWithdraw} و ${maxWithdraw} USDT` });
+  }
+  if (user.isFrozen || user.status !== "active") {
+    return res.status(403).json({ error: "الحساب غير مؤهل للسحب حاليًا" });
+  }
+  if (user.balance < amt) {
+    return res.status(400).json({ error: "الرصيد غير كافٍ" });
+  }
+
+  user.balance -= amt;
+  user.usdtBalance -= amt;
 
   const newWithdrawal: Withdrawal = {
     id: "wd_" + Date.now(),
-    userId: user?.id || "u1",
-    username: user?.username || "asse_24",
+    userId: user.id,
+    username: user.username,
     amount: amt,
     usdtAmount: amt,
-    address: address || "0x...",
+    address,
     network: network || "POLYGON",
     status: "pending_approval",
     createdAt: new Date().toISOString()
@@ -1983,6 +2404,7 @@ app.post("/api/wallet/withdraw", (req, res) => {
 
   db.withdrawals.unshift(newWithdrawal);
   saveDB(db);
+  await saveUserDirect(user);
 
   res.json({ success: true, withdrawal: newWithdrawal });
 });
@@ -2007,15 +2429,19 @@ app.post("/api/tasks/validate-access-code", async (req, res) => {
   const db = loadDB();
   const submitted = (req.body?.code || req.body?.accessCode || "").toString().trim().toUpperCase();
 
-  const currentCode = (db.siteSettings.currentTaskAccessCode || "TERO1234").toUpperCase();
-  const activeCodes = (db.taskAccessCodes || []).map(c => c.code.toUpperCase());
+  // Fixed: previously "TERO1234" and "TERO2026" always worked no matter
+  // what code was actually configured, defeating the point of rotating
+  // codes. Now only codes present in taskAccessCodes are checked, and
+  // each one is required to still be within its validHours window.
+  const now = Date.now();
+  const activeCodes = (db.taskAccessCodes || []).filter(c => {
+    if ((c.status || "running") !== "running") return false;
+    if (!c.validHours) return true;
+    const createdAt = new Date(c.createdAt).getTime();
+    return now - createdAt <= c.validHours * 60 * 60 * 1000;
+  }).map(c => c.code.toUpperCase());
 
-  const isValid = submitted && (
-    submitted === currentCode ||
-    activeCodes.includes(submitted) ||
-    submitted === "TERO1234" ||
-    submitted === "TERO2026"
-  );
+  const isValid = Boolean(submitted) && activeCodes.includes(submitted);
 
   if (isValid) {
     return res.json({ ok: true, success: true, valid: true });
@@ -2048,10 +2474,16 @@ app.get("/api/referrals", (req, res) => {
   res.json([]);
 });
 
-app.get("/api/referrals/stats", (req, res) => {
+app.get("/api/referrals/stats", async (req, res) => {
+  await ensureHydrated();
   const db = loadDB();
-  const user = db.users[0] as User | undefined;
-  res.json({ totalEarned: 0.00, totalReferrals: 0, referralCode: user?.referralCode || "TQ69JZ" });
+  const user = getAuthenticatedUser(req, db);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  res.json({
+    totalEarned: 0.00,
+    totalReferrals: user.referralsCount || 0,
+    referralCode: user.referralCode || "TQ69JZ"
+  });
 });
 
 app.get("/api/referrals/salary-history", (req, res) => {

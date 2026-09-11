@@ -1,8 +1,18 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    // BEFORE: `allow read, write: if true;` — anyone on the internet could
+    // read or write every collection (users, deposits, withdrawals,
+    // balances...) directly, bypassing the API entirely.
+    //
+    // AFTER: the Express server now talks to Firestore through the Admin
+    // SDK (see server.ts), which authenticates as a trusted service
+    // account and always has full access regardless of these rules. The
+    // web/mobile client never talks to Firestore directly — it only calls
+    // this app's /api/* endpoints. So direct client access can (and
+    // should) be denied entirely.
     match /{document=**} {
-      allow read, write: if true;
+      allow read, write: if false;
     }
   }
 }
